@@ -195,6 +195,17 @@ def _show_flow_json_dialog(title: str, json_text: str) -> None:
     st.code(json_text, language="json")
 
 
+@st.dialog("流程图", width="large")
+def _show_flow_image_dialog(title: str, image_path: str) -> None:
+    st.markdown(f"**{title}**")
+    path = Path(image_path)
+    if path.is_file():
+        st.image(str(path), use_container_width=True)
+        st.caption(str(path))
+    else:
+        st.warning("流程图文件不存在或路径无效")
+
+
 def _flow_heading(flow: WorkflowFlowResult) -> str:
     hint = (flow.image.title_hint or "").strip()
     if hint:
@@ -322,62 +333,62 @@ def _render_flow_item(flow: WorkflowFlowResult, *, dialog_key: str) -> None:
     heading = _flow_heading(flow)
     st.markdown(f"##### {heading}")
 
-    col_img, col_info = st.columns([1, 2])
-    with col_img:
+    action_col, _ = st.columns([1, 3])
+    with action_col:
         if not flow.skipped and Path(flow.image.path).is_file():
-            st.image(flow.image.path, use_container_width=True)
+            if st.button("查看流程图", key=f"img_{dialog_key}", type="secondary"):
+                _show_flow_image_dialog(heading, flow.image.path)
         elif flow.skipped:
-            st.info("已废弃，无流程图")
+            st.caption("已废弃，无流程图")
 
-    with col_info:
-        if flow.skipped:
-            st.warning(flow.error or "已废弃")
-        elif flow.success:
-            st.caption(f"节点 {len(flow.nodes)} 个 · 置信度 {flow.confidence:.0%}")
-            with st.expander("节点列表", expanded=False):
-                for node in flow.nodes:
-                    st.markdown(
-                        f"- **{node.seq}.** [{node.node_type}] {node.content} "
-                        f"（{node.shape}）"
-                    )
-            with st.expander("调试：覆盖本地 parse 缓存", expanded=False):
-                st.caption(
-                    "仅用于开发对照，非正式链路。"
-                    "生产上 parse_result 以 VLM 对 Word 图的识别为准；"
-                    "环节命名、分支绑定等需求加工由「流程写入」侧的编译器实现。"
+    if flow.skipped:
+        st.warning(flow.error or "已废弃")
+    elif flow.success:
+        st.caption(f"节点 {len(flow.nodes)} 个 · 置信度 {flow.confidence:.0%}")
+        with st.expander("节点列表", expanded=False):
+            for node in flow.nodes:
+                st.markdown(
+                    f"- **{node.seq}.** [{node.node_type}] {node.content} "
+                    f"（{node.shape}）"
                 )
-                edits: dict[int, str] = {}
-                for node in flow.nodes:
-                    edits[node.seq] = st.text_input(
-                        f"seq {node.seq} · {node.node_type}",
-                        value=node.content or "",
-                        key=f"node_edit_{dialog_key}_{node.seq}",
+        with st.expander("调试：覆盖本地 parse 缓存", expanded=False):
+            st.caption(
+                "仅用于开发对照，非正式链路。"
+                "生产上 parse_result 以 VLM 对 Word 图的识别为准；"
+                "环节命名、分支绑定等需求加工由「流程写入」侧的编译器实现。"
+            )
+            edits: dict[int, str] = {}
+            for node in flow.nodes:
+                edits[node.seq] = st.text_input(
+                    f"seq {node.seq} · {node.node_type}",
+                    value=node.content or "",
+                    key=f"node_edit_{dialog_key}_{node.seq}",
+                )
+            if st.button("保存到本地缓存", key=f"save_nodes_{dialog_key}"):
+                result: GuideParseResult | None = st.session_state.get("parse_result")
+                if result is None:
+                    st.error("无解析结果可保存")
+                elif _apply_flow_node_edits(result, flow, edits):
+                    save_result(
+                        result,
+                        section_from=result.section_from,
+                        section_to=result.section_to,
+                        vlm_flow_limit=result.vlm_flow_limit,
+                        settings=settings,
                     )
-                if st.button("保存到本地缓存", key=f"save_nodes_{dialog_key}"):
-                    result: GuideParseResult | None = st.session_state.get("parse_result")
-                    if result is None:
-                        st.error("无解析结果可保存")
-                    elif _apply_flow_node_edits(result, flow, edits):
-                        save_result(
-                            result,
-                            section_from=result.section_from,
-                            section_to=result.section_to,
-                            vlm_flow_limit=result.vlm_flow_limit,
-                            settings=settings,
-                        )
-                        st.session_state.parse_result = normalize_parse_result(result)
-                        st.session_state.result_from_store = True
-                        st.success("节点修改已写入 parse_result.json，请到「流程写入」一键写入。")
-                        st.rerun()
-                    else:
-                        st.info("内容无变化，未写入。")
-        elif "调试模式" in (flow.error or ""):
-            st.warning(flow.error)
-        else:
-            st.error(flow.error or "解析失败")
+                    st.session_state.parse_result = normalize_parse_result(result)
+                    st.session_state.result_from_store = True
+                    st.success("节点修改已写入 parse_result.json，请到「流程写入」一键写入。")
+                    st.rerun()
+                else:
+                    st.info("内容无变化，未写入。")
+    elif "调试模式" in (flow.error or ""):
+        st.warning(flow.error)
+    else:
+        st.error(flow.error or "解析失败")
 
-        if st.button("查看 JSON", key=f"json_{dialog_key}", type="secondary"):
-            _show_flow_json_dialog(heading, flow.to_json_text())
+    if st.button("查看 JSON", key=f"json_{dialog_key}", type="secondary"):
+        _show_flow_json_dialog(heading, flow.to_json_text())
 
 
 def _render_sector_result(
@@ -542,6 +553,7 @@ if start_clicked:
             section_to=int(section_to),
             on_progress=_on_progress,
             vlm_flow_limit=0,
+            per_sector_flow_limit=0,
         )
         skip_holder["skipped"] = result.skipped_flowcharts
         to_parse = result.total_flowcharts - result.skipped_flowcharts

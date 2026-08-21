@@ -68,9 +68,10 @@ class Settings(BaseSettings):
     data_dir: Path = Path("./data")
     output_dir: Path = Path("./output")
     log_dir: Path = Path("./logs")
-    guide_docx_name: str = "野马集团办事指南2026080301.docx"
-    guide_output_stem: str = "guide_2026080301"
-    flow_task_table_name: str = "野马集团流程任务表0807.xlsx"
+    guide_docx_name: str = "野马集团办事指南20260816.docx"
+    guide_output_stem: str = "guide_20260816"
+    flow_task_table_name: str = "野马集团流程任务表0816.xlsx"
+    template_table_name: str = "可做模板表0812.xlsx"
     vlm_flow_limit: int = 0
     guide_parse_use_cache: bool = Field(
         default=False,
@@ -79,9 +80,21 @@ class Settings(BaseSettings):
             "True=批量模式：复用 parse 缓存加速，文档更新后请在流程解析页手动重新解析"
         ),
     )
+    workflow_per_sector_limit: int = Field(
+        default=0,
+        description="全量试点：每板块除静态样例外仅解析/写入前 N 个流程；0=不限制",
+    )
 
-    shenbi_base_url: str = "https://www.cloudschool.cn/gateway"
-    shenbi_api_token: str = "qhGhcPqf7H6xQI2u"
+    shenbi_environment: str = Field(
+        default="ym",
+        description="神笔工作环境：dev=开发环境(cloudschool)，ym=野马数智化平台",
+    )
+    shenbi_dev_api_token: str = "qhGhcPqf7H6xQI2u"
+    shenbi_ym_api_token: str = "V4rodLnifNkzcE3b"
+    shenbi_dev_tenant_id: str = "aa4f8c3fa79111eda3250242ac120002"
+    shenbi_ym_tenant_id: str = "8c12892417855bcc6b844984a4f940b9"
+    shenbi_base_url: str = "http://ym.zhiduo.net/gateway"
+    shenbi_api_token: str = ""
     shenbi_ssl_verify: bool = False
     shenbi_session_cookie: str = Field(
         default="SESSION=SESSION",
@@ -92,11 +105,15 @@ class Settings(BaseSettings):
         description="访问神笔平台的 HTTP 代理；留空则回退到 OA_PROXY",
     )
     shenbi_app_id: str = "bf610a25d83c6bf843a8893073a3b304"
-    shenbi_tenant_id: str = "aa4f8c3fa79111eda3250242ac120002"
+    shenbi_tenant_id: str = ""
 
     @property
     def flow_task_table_path(self) -> Path:
         return self.data_dir / self.flow_task_table_name
+
+    @property
+    def template_table_path(self) -> Path:
+        return self.data_dir / self.template_table_name
 
     @property
     def forms_store_dir(self) -> Path:
@@ -186,6 +203,26 @@ def update_shenbi_token(token: str) -> Path:
     return update_env_var("SHENBI_API_TOKEN", token.strip())
 
 
+def switch_shenbi_environment(env_key: str) -> Path:
+    """切换神笔工作环境并同步 .env 中的 base_url / token。"""
+    from core.config.shenbi_environments import get_shenbi_profile
+
+    profile = get_shenbi_profile(env_key)
+    current = get_settings()
+    if profile.key == "dev":
+        token = (current.shenbi_dev_api_token or profile.default_token).strip()
+        tenant = (current.shenbi_dev_tenant_id or profile.tenant_id).strip()
+    else:
+        token = (current.shenbi_ym_api_token or profile.default_token).strip()
+        tenant = (current.shenbi_ym_tenant_id or profile.tenant_id).strip()
+    update_env_var("SHENBI_ENVIRONMENT", profile.key)
+    update_env_var("SHENBI_BASE_URL", profile.base_url)
+    update_env_var("SHENBI_API_TOKEN", token)
+    update_env_var("SHENBI_TENANT_ID", tenant)
+    reload_settings()
+    return env_file_path()
+
+
 def _build_settings() -> Settings:
     settings = Settings()
     if not settings.output_dir.is_absolute():
@@ -198,4 +235,10 @@ def _build_settings() -> Settings:
         settings.log_dir = (PROJECT_ROOT / settings.log_dir).resolve()
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     settings.forms_store_dir.mkdir(parents=True, exist_ok=True)
+    from core.config.shenbi_environments import get_shenbi_config
+
+    cfg = get_shenbi_config(settings)
+    settings.shenbi_tenant_id = cfg.tenant_id
+    if not (settings.shenbi_api_token or "").strip():
+        settings.shenbi_api_token = cfg.api_token
     return settings

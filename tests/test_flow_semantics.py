@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from core.workflow.flow_semantics import guide_nodes_to_semantic_steps, semantic_steps_summary
+from core.workflow.complex_flow_builder import _cc_task_name
+from core.workflow.flow_semantics import guide_nodes_to_semantic_steps, semantic_steps_summary, strip_person_name
 from core.workflow.shenbi_builder import _build_task_tree_from_guide_nodes
 from schemas.workflow import WorkflowNodeItem
 
@@ -72,3 +73,12 @@ def test_build_task_tree_linear_four_steps():
     assert child["child"].get("taskKey")
     assert child["child"].get("taskName") == "会计审批"
     assert child["child"]["child"].get("taskKey") == "cc"
+
+
+def test_strip_person_name_cc_and_approval():
+    assert strip_person_name("野马集团总裁办副主任 马杰") == "野马集团总裁办副主任"
+    assert strip_person_name("陈刚 野马集团总经理") == "野马集团总经理"
+    assert strip_person_name("房务总监（陈晶晶）") == "房务总监"
+    assert strip_person_name("餐饮副总监（单鹏飞）") == "餐饮副总监"
+    assert _cc_task_name("野马集团总裁办副主任 马杰") == "抄送野马集团总裁办副主任"
+    assert "马杰" not in _cc_task_name("野马集团总裁办副主任 马杰")

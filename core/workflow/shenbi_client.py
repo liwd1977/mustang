@@ -13,6 +13,13 @@ from typing import Any
 import httpx
 
 from core.config.settings import PROJECT_ROOT, Settings, get_settings
+from core.config.shenbi_environments import get_shenbi_config, resolve_sector_yydl
+from core.workflow.flow_topology import (
+    local_task_tree_intact,
+    min_route_branches_for_local,
+    task_tree_degraded,
+    task_tree_has_routes,
+)
 from core.workflow.shenbi_builder import finalize_workflow_model, workflow_registry_slug
 
 MODEL_SAVE_PATH = "/fighter-baida/api/flow-simple/proc/model-save"
@@ -21,16 +28,17 @@ APP_QUERY_LIST_PATH = "/fighter-baida/api/baida/tBaidaApp/queryList"
 APP_MENU_SAVE_PATH = "/fighter-baida/api/baida/tBaidaMenu/saveOrUpdate"
 APP_MENU_QUERY_PATH = "/fighter-baida/api/baida/tBaidaMenu/queryList"
 PUBLISH_PATH = "/fighter-baida/api/flow-simple/proc/publish"
+PUBLISH_ALT_PATHS = (
+    "/fighter-baida/api/flow-simple/proc/deploy",
+    "/fighter-baida/api/flow-simple/proc/releaseProc",
+    "/fighter-baida/api/flow-simple/proc/publishProc",
+    "/fighter-baida/api/flow-simple/proc/model-publish",
+    "/fighter-baida/api/flow-simple/proc/saveAndPublish",
+)
 DEFAULT_FLOW_MENU_ICON = "el-icon-_condition"
 FLOW_MENU_TYPE = 2  # 流程表单页（参考 L_测试3 → 测试流程3）
-DEFAULT_APP_ICON = (
-    "https://www.cloudschool.cn/fastdfs/group1/M00/00/1B/rBMqYmdQDQmAOkrRAAAKAl_aFqI729.png"
-)
-DEFAULT_APP_CATEGORY = "3"  # 服务（与样例 yydl 一致）
 MODEL_FIELDS = ("id", "formModelJson", "formModel", "wfSimpleProc", "wfSimpleTaskInfo")
 SUCCESS_CODES = {None, 0, 200, "0", "200", "success"}
-SHENBI_ORIGIN = "https://www.cloudschool.cn"
-SHENBI_REFERER = "https://www.cloudschool.cn/baidaForm/"
 SHENBI_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
@@ -42,19 +50,42 @@ def _resolve_proxy(settings: Settings) -> str | None:
     return proxy or None
 
 
+def _resolve_token(token: str | None, settings: Settings) -> str:
+    explicit = (token or "").strip()
+    if explicit:
+        return explicit
+    return get_shenbi_config(settings).api_token
+
+
+def _build_request_cookie(token: str, settings: Settings) -> str:
+    """合并浏览器 SESSION 与 fighter-auth-token（网关发布/运行时查询常需 Cookie 中带 token）。"""
+    raw = (settings.shenbi_session_cookie or "").strip()
+    parts: list[str] = []
+    normalized = raw.replace(" ", "")
+    if raw and normalized not in {"SESSION=SESSION", "SESSION"}:
+        parts.append(raw.rstrip("; "))
+    token_cookie = f"fighter-auth-token={token}"
+    if not any(p.strip().startswith("fighter-auth-token=") for p in parts):
+        parts.append(token_cookie)
+    return "; ".join(parts)
+
+
 def _api_headers(token: str, *, settings: Settings | None = None) -> dict[str, str]:
     settings = settings or get_settings()
+    cfg = get_shenbi_config(settings)
     headers = {
         "fighter-auth-token": token,
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
-        "Origin": SHENBI_ORIGIN,
-        "Referer": SHENBI_REFERER,
+        "Origin": cfg.origin,
+        "Referer": cfg.referer,
         "User-Agent": SHENBI_USER_AGENT,
     }
-    cookie = (settings.shenbi_session_cookie or "").strip()
-    if cookie:
-        headers["Cookie"] = cookie
+    tenant_id = (cfg.tenant_id or settings.shenbi_tenant_id or "").strip()
+    if tenant_id:
+        headers["tenantId"] = tenant_id
+        headers["Tenant-Id"] = tenant_id
+    headers["Cookie"] = _build_request_cookie(token, settings)
     return headers
 
 
@@ -194,6 +225,137 @@ def sync_from_property_list_task_ids(task_root: dict | None) -> None:
                 fp["taskId"] = task_id if task_id else None
 
 
+def prepare_from_property_list_for_platform_save(task_root: dict | None) -> None:
+    """权限 update 保存前：对齐 taskId、清空条目 id，并去掉系统隐藏字段的 hide 项。"""
+    from core.workflow.shenbi_builder import HIDDEN_FORM_FIELD_PROPS
+
+    if not isinstance(task_root, dict):
+        return
+    sync_from_property_list_task_ids(task_root)
+    for task in iter_all_tasks(task_root):
+        if task.get("type") not in {"STARTTASK", "USERTASK"}:
+            continue
+        props = task.get("properties")
+        if not isinstance(props, dict):
+            continue
+        fpl = props.get("fromPropertyList")
+        if not isinstance(fpl, list):
+            continue
+        cleaned: list[dict] = []
+        for fp in fpl:
+            if not isinstance(fp, dict):
+                continue
+            prop = fp.get("fieldProp")
+            if fp.get("operating") == "hide" and prop in HIDDEN_FORM_FIELD_PROPS:
+                continue
+            entry = dict(fp)
+            entry["id"] = None
+            entry["creator"] = None
+            entry["createTime"] = None
+            entry["updator"] = None
+            entry["updateTime"] = None
+            cleaned.append(entry)
+        props["fromPropertyList"] = cleaned
+
+
+def merge_local_form_permissions_by_task_key(
+    platform_root: dict | None,
+    local_root: dict | None,
+) -> None:
+    """仅把本地 fromPropertyList 按 taskKey 覆盖到平台环节树，保留平台 pid/procId/按钮/办理人。"""
+    if not isinstance(platform_root, dict) or not isinstance(local_root, dict):
+        return
+    local_by_key = index_tasks_by_key(local_root)
+    for task in iter_all_tasks(platform_root):
+        if task.get("type") not in {"STARTTASK", "USERTASK"}:
+            continue
+        key = str(task.get("taskKey") or "").strip()
+        local_task = local_by_key.get(key)
+        if not local_task:
+            continue
+        local_props = local_task.get("properties") if isinstance(local_task.get("properties"), dict) else {}
+        local_fpl = local_props.get("fromPropertyList")
+        if not isinstance(local_fpl, list):
+            continue
+        props = task.setdefault("properties", {})
+        if not isinstance(props, dict):
+            continue
+        task_id = task.get("id")
+        merged_fpl: list[dict] = []
+        for fp in local_fpl:
+            if not isinstance(fp, dict):
+                continue
+            entry = copy.deepcopy(fp)
+            entry["id"] = None
+            entry["taskId"] = str(task_id) if task_id else None
+            entry["creator"] = None
+            entry["createTime"] = None
+            entry["updator"] = None
+            entry["updateTime"] = None
+            merged_fpl.append(entry)
+        props["fromPropertyList"] = merged_fpl
+
+
+def _merge_property_row_ids(local_rows: Any, plat_rows: Any) -> None:
+    if not isinstance(local_rows, list) or not isinstance(plat_rows, list):
+        return
+    for i, local_row in enumerate(local_rows):
+        if not isinstance(local_row, dict) or i >= len(plat_rows):
+            continue
+        plat_row = plat_rows[i]
+        if not isinstance(plat_row, dict):
+            continue
+        if plat_row.get("id") is not None:
+            local_row["id"] = plat_row["id"]
+        if plat_row.get("taskId") is not None:
+            local_row["taskId"] = plat_row["taskId"]
+
+
+def merge_platform_task_tree_inplace(local_node: dict | None, plat_node: dict | None) -> None:
+    """按相同拓扑位置合并平台 id/pid/procId（含 ROUTE 等无 taskKey 节点）。"""
+    if not isinstance(local_node, dict):
+        return
+    if isinstance(plat_node, dict):
+        for field in ("id", "pid", "procId"):
+            if plat_node.get(field) is not None:
+                local_node[field] = plat_node[field]
+        local_props = local_node.get("properties")
+        plat_props = plat_node.get("properties")
+        if isinstance(local_props, dict) and isinstance(plat_props, dict):
+            for key in ("buttonList", "branchConditionList", "personList"):
+                _merge_property_row_ids(local_props.get(key), plat_props.get(key))
+
+    local_child = local_node.get("child")
+    plat_child = plat_node.get("child") if isinstance(plat_node, dict) else None
+    if isinstance(local_child, dict):
+        merge_platform_task_tree_inplace(local_child, plat_child if isinstance(plat_child, dict) else None)
+
+    local_conds = local_node.get("conditions") or []
+    plat_conds = (plat_node.get("conditions") or []) if isinstance(plat_node, dict) else []
+    if isinstance(local_conds, list):
+        for idx, local_cond in enumerate(local_conds):
+            if not isinstance(local_cond, dict):
+                continue
+            plat_cond = plat_conds[idx] if idx < len(plat_conds) else None
+            merge_platform_task_tree_inplace(local_cond, plat_cond if isinstance(plat_cond, dict) else None)
+
+
+def task_tree_from_save_response(response: dict | None) -> dict | None:
+    if not isinstance(response, dict):
+        return None
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return None
+    task = _maybe_parse_json(data.get("wfSimpleTaskInfo"))
+    return task if isinstance(task, dict) and task.get("type") else None
+
+
+def _start_task_has_platform_id(task_root: dict | None) -> bool:
+    if not isinstance(task_root, dict):
+        return False
+    return bool(task_root.get("id"))
+
+
 def merge_platform_task_ids(local_root: dict | None, platform_root: dict | None) -> None:
     """按 taskKey 将平台环节 id 写回本地树（保留本地 fromPropertyList）。"""
     if not isinstance(local_root, dict) or not isinstance(platform_root, dict):
@@ -259,6 +421,16 @@ def apply_saved_ids(model: dict, *, form_id: str, proc_id: str) -> dict:
     """将平台返回的 formId / procId 写回模型，并同步流程环节树（保留设计器节点 id）。"""
     from core.workflow.shenbi_builder import _sync_task_tree_proc_ids
 
+    updated = apply_proc_form_ids_only(model, form_id=form_id, proc_id=proc_id)
+    if updated.get("wfSimpleTaskInfo"):
+        updated["wfSimpleTaskInfo"] = _sync_task_tree_proc_ids(
+            updated["wfSimpleTaskInfo"], proc_id=proc_id
+        )
+    return updated
+
+
+def apply_proc_form_ids_only(model: dict, *, form_id: str, proc_id: str) -> dict:
+    """仅写入 formId/procId，不重建环节 id/pid（权限补写须保留 create 后平台 id 链）。"""
     updated = copy.deepcopy(model)
     form_model = updated.setdefault("formModel", {})
     proc = updated.setdefault("wfSimpleProc", {})
@@ -266,10 +438,6 @@ def apply_saved_ids(model: dict, *, form_id: str, proc_id: str) -> dict:
     proc["fromId"] = form_id
     proc["id"] = proc_id
     proc["complexProcId"] = None
-    if updated.get("wfSimpleTaskInfo"):
-        updated["wfSimpleTaskInfo"] = _sync_task_tree_proc_ids(
-            updated["wfSimpleTaskInfo"], proc_id=proc_id
-        )
     return updated
 
 
@@ -353,22 +521,34 @@ def build_app_save_payload(
     workflow_name: str,
     *,
     app_id: str | None = None,
+    app_mc: str | None = None,
+    form_slug: str | None = None,
+    app_category: str | None = None,
+    sector_title: str | None = None,
+    sector_index: int = 0,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     """组装 tBaidaApp/saveOrUpdate 请求体；mc = 流程显示名。"""
-    from core.workflow.shenbi_builder import WORKFLOW_CATALOG, display_workflow_name
+    from core.workflow.shenbi_builder import display_workflow_name
 
     settings = settings or get_settings()
-    mc = display_workflow_name(workflow_name)
-    meta = WORKFLOW_CATALOG.get(workflow_name, {})
-    form_slug = str(meta.get("form_slug") or workflow_name)
+    cfg = get_shenbi_config(settings)
+    mc = app_mc or display_workflow_name(workflow_name)
+    if not form_slug:
+        from core.workflow.workflow_catalog import get_catalog_meta
+
+        meta = get_catalog_meta(workflow_name, settings=settings)
+        form_slug = str(meta.get("form_slug") or workflow_name)
+    else:
+        form_slug = str(form_slug)
+    yydl = app_category or resolve_sector_yydl(sector_title or "", sector_index=sector_index)
     payload: dict[str, Any] = {
-        "icons": DEFAULT_APP_ICON,
+        "icons": cfg.app_icon,
         "mc": mc,
         "sfqy": "1",
         "template": 0,
         "yyjj": f"野马智能交付工作台自动创建 · 关联 OA 表单 {form_slug}",
-        "yydl": DEFAULT_APP_CATEGORY,
+        "yydl": yydl,
         "device": 2,
         "sfsy": 0,
     }
@@ -400,7 +580,7 @@ def save_or_update_app(
 ) -> dict:
     """调用 tBaidaApp/saveOrUpdate 创建或更新应用。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     if not token:
         raise ShenbiApiError("未配置神笔平台 token（fighter-auth-token）")
 
@@ -443,7 +623,7 @@ def query_app_list(
 ) -> list[dict[str, Any]]:
     """查询租户下全部应用（tBaidaApp/queryList）。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     if not token:
         raise ShenbiApiError("未配置神笔平台 token（fighter-auth-token）")
 
@@ -482,6 +662,59 @@ def query_app_list(
     return []
 
 
+def collect_app_name_candidates(
+    workflow_name: str,
+    registry: dict | None = None,
+) -> list[str]:
+    """收集应用名称候选（含 guide hints 与去掉单/表 的旧版名称）。"""
+    from core.form.name_utils import display_form_name
+    from core.workflow.shenbi_builder import display_workflow_name
+    from core.workflow.workflow_catalog import get_catalog_hints
+
+    names: list[str] = []
+
+    def add(raw: str) -> None:
+        text = display_form_name(str(raw or "")).strip()
+        if text and text not in names:
+            names.append(text)
+
+    add(display_workflow_name(workflow_name))
+    if registry:
+        add(str(registry.get("app_mc") or ""))
+    for hint in get_catalog_hints(workflow_name):
+        add(hint)
+    for name in list(names):
+        for suffix in ("单", "表"):
+            if name.endswith(suffix) and len(name) > len(suffix):
+                add(name[: -len(suffix)])
+    return names
+
+
+def find_app_ids_by_name_candidates(
+    candidates: list[str],
+    *,
+    settings: Settings | None = None,
+    token: str | None = None,
+) -> list[tuple[str, str]]:
+    """按名称候选匹配全部应用，返回 [(app_id, mc)]（去重）。"""
+    targets = {(c or "").strip() for c in candidates if (c or "").strip()}
+    if not targets:
+        return []
+    seen: set[str] = set()
+    matches: list[tuple[str, str]] = []
+    for app in query_app_list(settings=settings, token=token):
+        mc = (app.get("mc") or "").strip()
+        app_id = app.get("id")
+        if not mc or not app_id:
+            continue
+        if mc in targets:
+            aid = str(app_id)
+            if aid not in seen:
+                seen.add(aid)
+                matches.append((aid, mc))
+    return matches
+
+
 def find_app_id_by_mc(
     mc: str,
     *,
@@ -489,13 +722,90 @@ def find_app_id_by_mc(
     token: str | None = None,
 ) -> str | None:
     """按应用名称精确匹配 appId。"""
-    target = (mc or "").strip()
-    if not target:
-        return None
+    matches = find_app_ids_by_name_candidates([mc], settings=settings, token=token)
+    return matches[0][0] if matches else None
+
+
+def app_exists_on_platform(
+    app_id: str,
+    *,
+    settings: Settings | None = None,
+    token: str | None = None,
+) -> bool:
+    """确认 appId 在 tBaidaApp/queryList 中真实存在（避免幽灵 id 误报成功）。"""
+    aid = (app_id or "").strip()
+    if not aid:
+        return False
     for app in query_app_list(settings=settings, token=token):
-        if (app.get("mc") or "").strip() == target and app.get("id"):
-            return str(app["id"])
-    return None
+        if str(app.get("id") or "").strip() == aid:
+            return True
+    return False
+
+
+def resolve_app_id_for_workflow(
+    workflow_name: str,
+    *,
+    registry: dict | None = None,
+    settings: Settings | None = None,
+    token: str | None = None,
+) -> tuple[str | None, str]:
+    """解析应写入的目标应用：verified registry > 名称候选（含旧版无单/表）。"""
+    registry = registry or load_workflow_registry(workflow_name, settings=settings)
+    if registry_app_verified(registry) and registry.get("app_id"):
+        reg_id = str(registry["app_id"])
+        if app_exists_on_platform(reg_id, settings=settings, token=token):
+            return reg_id, "registry"
+    candidates = collect_app_name_candidates(workflow_name, registry)
+    matches = find_app_ids_by_name_candidates(candidates, settings=settings, token=token)
+    if matches:
+        return matches[0][0], "reuse"
+    return None, "create"
+
+
+def rebind_flow_menus_for_workflow_aliases(
+    *,
+    workflow_name: str,
+    primary_app_id: str,
+    title: str,
+    form_id: str,
+    proc_id: str,
+    proc_key: str,
+    registry: dict | None = None,
+    settings: Settings | None = None,
+    token: str | None = None,
+) -> list[dict]:
+    """将主应用及所有同名/旧名别名的应用菜单绑定到同一 formId/procId。"""
+    app_ids: list[str] = []
+    seen: set[str] = set()
+
+    def add(app_id: str) -> None:
+        aid = (app_id or "").strip()
+        if aid and aid not in seen:
+            seen.add(aid)
+            app_ids.append(aid)
+
+    add(primary_app_id)
+    for aid, _mc in find_app_ids_by_name_candidates(
+        collect_app_name_candidates(workflow_name, registry),
+        settings=settings,
+        token=token,
+    ):
+        add(aid)
+
+    steps: list[dict] = []
+    for aid in app_ids:
+        steps.extend(
+            rebind_all_flow_menus(
+                app_id=aid,
+                title=title,
+                form_id=form_id,
+                proc_id=proc_id,
+                proc_key=proc_key,
+                settings=settings,
+                token=token,
+            )
+        )
+    return steps
 
 
 def _app_name_exists_error(exc: ShenbiApiError) -> bool:
@@ -515,7 +825,7 @@ def list_app_menus(
 ) -> list[dict[str, Any]]:
     """返回指定应用下的页面菜单（按 applicationId 过滤）。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     if not token:
         raise ShenbiApiError("未配置神笔平台 token（fighter-auth-token）")
 
@@ -601,10 +911,12 @@ def rebind_all_flow_menus(
         )
         return [step]
     for menu in menus:
-        menu_title = str(menu.get("title") or title).strip() or title
+        old_title = str(menu.get("title") or "").strip()
+        menu_title = title.strip() or old_title
         extend = menu.get("extendInfo") if isinstance(menu.get("extendInfo"), dict) else {}
         bound_form, bound_proc = _menu_bound_ids(menu)
         needs_rebind = bound_form != form_id or bound_proc != proc_id
+        needs_rename = old_title != menu_title
         payload = build_flow_menu_payload(
             app_id=app_id,
             title=menu_title,
@@ -614,7 +926,7 @@ def rebind_all_flow_menus(
             menu_id=str(menu["menuId"]) if menu.get("menuId") else None,
             sort_number=int(menu.get("sortNumber") or 5),
         )
-        if needs_rebind or not menu.get("menuId"):
+        if needs_rebind or needs_rename or not menu.get("menuId"):
             mode = "rebind" if menu.get("menuId") else "create"
         else:
             mode = "existing"
@@ -642,7 +954,7 @@ def fetch_platform_model(
 ) -> dict | None:
     """model-get 回读平台流程；失败返回 None。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     if not token:
         return None
     base = settings.shenbi_base_url.rstrip("/")
@@ -816,7 +1128,7 @@ def save_app_menu(
 ) -> dict:
     """调用 tBaidaMenu/saveOrUpdate 创建或更新应用内流程菜单。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     if not token:
         raise ShenbiApiError("未配置神笔平台 token（fighter-auth-token）")
 
@@ -901,13 +1213,16 @@ def ensure_flow_menu_for_app(
         menu_id=str(existing["menuId"]) if existing and existing.get("menuId") else None,
         sort_number=int(existing.get("sortNumber") or 5) if existing else 5,
     )
-    if existing and not needs_rebind:
+    if existing and not needs_rebind and str(existing.get("title") or "").strip() == title.strip():
         mode = "existing"
     elif existing:
         mode = "rebind"
     else:
         mode = "create"
-    response = save_app_menu(payload, settings=settings, token=token)
+    if mode != "existing":
+        response = save_app_menu(payload, settings=settings, token=token)
+    else:
+        response = {"code": 200, "data": existing.get("menuId")}
     menu_id = extract_menu_id(response) or (str(existing["menuId"]) if existing and existing.get("menuId") else None)
     return {
         "step": "应用流程菜单",
@@ -924,42 +1239,80 @@ def ensure_app_for_workflow(
     settings: Settings | None = None,
     token: str | None = None,
     registry: dict | None = None,
+    app_mc: str | None = None,
+    form_slug: str | None = None,
+    template_mode: bool = False,
+    sector_title: str | None = None,
+    sector_index: int = 0,
 ) -> tuple[str, dict]:
     """调用 tBaidaApp/saveOrUpdate：优先复用同名应用，否则新建。"""
     from core.workflow.shenbi_builder import display_workflow_name
 
     settings = settings or get_settings()
     registry = registry or load_workflow_registry(workflow_name, settings=settings)
-    mc = display_workflow_name(workflow_name)
-    mode = "create"
-    app_id: str | None = None
-
-    if registry_app_verified(registry) and registry.get("app_id"):
-        app_id = str(registry["app_id"])
-        mode = "update"
+    if template_mode:
+        reg_id = str(registry.get("app_id") or "") if registry_app_verified(registry) else ""
+        app_id = reg_id if reg_id and app_exists_on_platform(reg_id, settings=settings, token=token) else None
+        resolve_mode = "registry" if app_id else "create"
     else:
-        app_id = find_app_id_by_mc(mc, settings=settings, token=token)
-        if app_id:
-            mode = "reuse"
+        app_id, resolve_mode = resolve_app_id_for_workflow(
+            workflow_name,
+            registry=registry,
+            settings=settings,
+            token=token,
+        )
+    mode = {"registry": "update", "reuse": "reuse", "create": "create"}[resolve_mode]
 
-    payload = build_app_save_payload(workflow_name, app_id=app_id, settings=settings)
+    payload = build_app_save_payload(
+        workflow_name,
+        app_id=app_id,
+        app_mc=app_mc or (registry.get("app_mc") if registry else None) or display_workflow_name(workflow_name),
+        form_slug=form_slug,
+        sector_title=sector_title,
+        sector_index=sector_index,
+        settings=settings,
+    )
 
     try:
         response = save_or_update_app(payload, settings=settings, token=token)
     except ShenbiApiError as exc:
         if mode == "create" and _app_name_exists_error(exc):
-            app_id = find_app_id_by_mc(mc, settings=settings, token=token)
-            if not app_id:
+            if template_mode and payload.get("mc"):
+                candidates = [str(payload["mc"])]
+            else:
+                candidates = collect_app_name_candidates(workflow_name, registry)
+            matches = find_app_ids_by_name_candidates(candidates, settings=settings, token=token)
+            if not matches:
                 raise
-            payload = build_app_save_payload(workflow_name, app_id=app_id, settings=settings)
+            app_id = matches[0][0]
+            payload = build_app_save_payload(
+                workflow_name,
+                app_id=app_id,
+                app_mc=payload.get("mc"),
+                form_slug=form_slug,
+                sector_title=sector_title,
+                sector_index=sector_index,
+                settings=settings,
+            )
             response = save_or_update_app(payload, settings=settings, token=token)
             mode = "reuse"
         else:
             raise
 
     app_id = extract_app_id(response) or app_id
+    if app_id and not app_exists_on_platform(app_id, settings=settings, token=token):
+        payload.pop("id", None)
+        response = save_or_update_app(payload, settings=settings, token=token)
+        app_id = extract_app_id(response) or find_app_id_by_mc(str(payload.get("mc") or ""), settings=settings, token=token)
+        mode = "create"
     if not app_id:
         raise ShenbiApiError("创建应用后未返回 appId", body=response)
+    if not app_exists_on_platform(app_id, settings=settings, token=token):
+        raise ShenbiApiError(
+            f"应用保存后仍未在平台应用列表中找到（appId={app_id}，名称={payload.get('mc')}）。"
+            "请在「我的应用」搜索完整应用名（含 AI_ 前缀）。",
+            body=response,
+        )
     return app_id, {
         "step": "应用",
         "mode": mode,
@@ -1003,49 +1356,37 @@ def apply_registry_to_payloads(
     *,
     settings: Settings | None = None,
 ) -> dict:
-    """生成 JSON 后注入已创建流程的平台 ID，相同 workflow 走更新而非新建。"""
-    form_id, proc_id, app_id = resolve_platform_ids(payloads, workflow_name, settings=settings)
-    flow_kind = _workflow_flow_kind(workflow_name)
-    if flow_kind == "complex_recruitment":
-        # 复杂招聘流程每次全量新建表单/流程，仅复用 appId 绑定同一应用
-        if not app_id:
-            return payloads
-        merged = copy.deepcopy(payloads)
-        model = merged.get("model")
-        if isinstance(model, dict):
-            model.setdefault("wfSimpleProc", {})["appId"] = app_id
-            form_model = model.setdefault("formModel", {})
-            form_model.pop("formId", None)
-            proc = model["wfSimpleProc"]
-            proc.pop("id", None)
-            proc.pop("fromId", None)
-            strip_task_create_ids(model.get("wfSimpleTaskInfo"))
-            merged["model"] = finalize_workflow_model(model)
-        return merged
-    if not form_id or not proc_id:
+    """生成 JSON 后注入 appId；verified registry 存在时保留 form/proc/procKey 走更新。"""
+    settings = settings or get_settings()
+    registry = load_workflow_registry(workflow_name, settings=settings)
+    if not registry_app_verified(registry) or not registry.get("app_id"):
         return payloads
     merged = copy.deepcopy(payloads)
     model = merged.get("model")
-    if isinstance(model, dict):
-        updated = apply_saved_ids(model, form_id=form_id, proc_id=proc_id)
-        if app_id:
-            updated.setdefault("wfSimpleProc", {})["appId"] = app_id
-        registry = load_workflow_registry(workflow_name, settings=settings) or {}
-        proc = updated.setdefault("wfSimpleProc", {})
-        if registry.get("proc_key"):
-            proc["procKey"] = registry["proc_key"]
-        fm = updated.setdefault("formModel", {})
-        proc_key = str(registry.get("proc_key") or proc.get("procKey") or "")
-        table_name = str(registry.get("table_name") or fm.get("tableName") or proc_key)
-        if proc_key and table_name != proc_key:
-            table_name = proc_key
-        if table_name:
-            fm["tableName"] = table_name
-            proc["procKey"] = proc_key or table_name
-        task_ids = registry.get("task_id_by_key")
-        if isinstance(task_ids, dict) and updated.get("wfSimpleTaskInfo"):
-            apply_task_id_by_key(updated["wfSimpleTaskInfo"], task_ids)
-        merged["model"] = finalize_workflow_model(updated)
+    if not isinstance(model, dict):
+        return merged
+    app_id = str(registry["app_id"])
+    model.setdefault("wfSimpleProc", {})["appId"] = app_id
+    form_id = str(registry.get("form_id") or "")
+    proc_id = str(registry.get("proc_id") or "")
+    proc_key = str(registry.get("proc_key") or registry.get("table_name") or "")
+    if form_id and proc_id and proc_key:
+        form_model = model.setdefault("formModel", {})
+        form_model["formId"] = form_id
+        form_model["tableName"] = proc_key
+        proc = model["wfSimpleProc"]
+        proc["id"] = proc_id
+        proc["fromId"] = form_id
+        proc["procKey"] = proc_key
+        merged["is_update"] = True
+    else:
+        form_model = model.setdefault("formModel", {})
+        form_model.pop("formId", None)
+        proc = model["wfSimpleProc"]
+        proc.pop("id", None)
+        proc.pop("fromId", None)
+        strip_task_create_ids(model.get("wfSimpleTaskInfo"))
+    merged["model"] = finalize_workflow_model(model)
     return merged
 
 
@@ -1073,12 +1414,6 @@ def assess_model_save_response(response: dict, *, local_model: dict) -> dict:
     }
 
 
-def _workflow_flow_kind(workflow_name: str) -> str:
-    from core.workflow.shenbi_builder import WORKFLOW_CATALOG
-
-    return str((WORKFLOW_CATALOG.get(workflow_name) or {}).get("flow_kind") or "linear")
-
-
 def _count_route_branches(task_root: dict | None) -> int:
     if not isinstance(task_root, dict):
         return 0
@@ -1094,6 +1429,142 @@ def _is_stale_registry_save_error(exc: ShenbiApiError) -> bool:
     msg = str(body.get("msg") or body.get("message") or exc.args[0] or "")
     markers = ("formId", "FORM_MODEL", "procId", "流程不存在", "不存在该表单", "不存在该流程")
     return any(m in msg for m in markers)
+
+
+def _is_model_conversion_error(exc: ShenbiApiError) -> bool:
+    body = exc.body if isinstance(getattr(exc, "body", None), dict) else {}
+    code = body.get("code")
+    msg = str(body.get("msg") or body.get("message") or "")
+    return code in (13, "13") or "模型转换失败" in msg
+
+
+def _is_recoverable_model_save_error(exc: ShenbiApiError) -> bool:
+    return _is_model_conversion_error(exc) or _is_stale_registry_save_error(exc)
+
+
+def normalize_model_tenant_ids(model: dict, tenant_id: str) -> None:
+    """保存前统一 tenantId，避免 dev/ym 环境切换后 payload 仍带旧租户导致 code=13。"""
+    tid = (tenant_id or "").strip()
+    if not tid:
+        return
+    proc = model.get("wfSimpleProc")
+    if isinstance(proc, dict):
+        proc["tenantId"] = tid
+    task_root = model.get("wfSimpleTaskInfo")
+    if not isinstance(task_root, dict):
+        return
+    for task in iter_all_tasks(task_root):
+        if isinstance(task.get("tenantId"), str) or task.get("tenantId") is not None:
+            task["tenantId"] = tid
+        props = task.get("properties")
+        if not isinstance(props, dict):
+            continue
+        for collection_key in ("personList", "buttonList", "fromPropertyList", "branchConditionList"):
+            for item in props.get(collection_key) or []:
+                if isinstance(item, dict):
+                    item["tenantId"] = tid
+
+
+def _sync_settings_tenant(settings: Settings) -> Settings:
+    from core.config.shenbi_environments import resolve_shenbi_tenant_id
+
+    tenant_id = resolve_shenbi_tenant_id(settings)
+    if settings.shenbi_tenant_id == tenant_id:
+        return settings
+    return settings.model_copy(update={"shenbi_tenant_id": tenant_id})
+
+
+def _create_response_degraded(
+    response: dict,
+    local_tree: dict | None,
+    *,
+    min_route_branches: int,
+) -> bool:
+    """平台 create 响应相对本地树是否为空壳/不完整。"""
+    if not response_has_task_tree(response):
+        return True
+    create_tree = task_tree_from_save_response(response)
+    if isinstance(create_tree, dict) and task_tree_degraded(create_tree, local_tree):
+        return True
+    return _response_looks_like_shell(response, min_route_branches=min_route_branches)
+
+
+def _apply_create_save_with_shell_recovery(
+    model: dict,
+    body: dict,
+    *,
+    local_tree: dict | None,
+    min_route_branches: int,
+    settings: Settings | None,
+    token: str | None,
+    results: list[dict],
+    recreate: bool,
+) -> tuple[dict, dict]:
+    """model-save create；空壳时自动重试一次并保留本地环节树。"""
+    settings = _sync_settings_tenant(settings or get_settings())
+    normalize_model_tenant_ids(body, settings.shenbi_tenant_id)
+    try:
+        response = save_proc_model(body, settings=settings, token=token)
+    except ShenbiApiError as exc:
+        if _is_model_conversion_error(exc):
+            normalize_model_tenant_ids(body, settings.shenbi_tenant_id)
+            response = save_proc_model(body, settings=settings, token=token)
+        else:
+            raise
+    save_hint = assess_model_save_response(response, local_model=body)
+    mode = "create" if not recreate else "create（重建）"
+    results.append(
+        {
+            "step": "表单与流程",
+            "mode": mode,
+            "response": response,
+            "detail": save_hint.get("message"),
+        }
+    )
+
+    degraded = _create_response_degraded(
+        response, local_tree, min_route_branches=min_route_branches
+    )
+    if degraded and local_task_tree_intact(local_tree):
+        retry_response = save_proc_model(body, settings=settings, token=token)
+        retry_hint = assess_model_save_response(retry_response, local_model=body)
+        results.append(
+            {
+                "step": "空壳恢复",
+                "mode": "retry",
+                "response": retry_response,
+                "detail": retry_hint.get("message") or "检测到空壳响应，已自动重试 create",
+            }
+        )
+        if not _create_response_degraded(
+            retry_response, local_tree, min_route_branches=min_route_branches
+        ):
+            response = retry_response
+            degraded = False
+
+    model = finalize_workflow_model(merge_save_response_preserve_tree(model, response))
+    create_tree = task_tree_from_save_response(response)
+    if isinstance(create_tree, dict):
+        merge_platform_task_tree_inplace(model.get("wfSimpleTaskInfo"), create_tree)
+        merge_platform_task_ids(model.get("wfSimpleTaskInfo"), create_tree)
+
+    if degraded and local_task_tree_intact(local_tree):
+        model["wfSimpleTaskInfo"] = copy.deepcopy(local_tree)
+        if isinstance(create_tree, dict):
+            merge_platform_task_ids(model.get("wfSimpleTaskInfo"), create_tree)
+            sync_from_property_list_task_ids(model.get("wfSimpleTaskInfo"))
+        results.append(
+            {
+                "step": "空壳恢复",
+                "mode": "warn",
+                "detail": (
+                    "平台 create 响应环节树不完整，已保留本地环节树并继续绑定菜单/权限；"
+                    "请在设计器确认流程结构"
+                ),
+            }
+        )
+
+    return model, response
 
 
 def _response_looks_like_shell(response: dict, *, min_route_branches: int = 2) -> bool:
@@ -1123,30 +1594,223 @@ def _prepare_model_save_body(
     is_update: bool,
     form_id: str | None,
     proc_id: str | None,
-    flow_kind: str,
-    strip_complex_tasks: bool = False,
 ) -> dict:
-    """组装 model-save 请求体。
-
-    复杂流程覆盖空壳时须 strip 环节 id 且 formModelJson=null；仅改权限时可保留环节 id。
-    """
+    """组装 model-save 请求体。create 时 strip 环节 id 且 formModelJson=null。"""
     if is_update:
         body = apply_saved_ids(
             sync_form_model_json(model),
             form_id=str(form_id or ""),
             proc_id=str(proc_id or ""),
         )
-    else:
-        body = strip_create_ids(sync_form_model_json(model))
+        body.setdefault("wfSimpleProc", {})["appId"] = app_id
+        return finalize_workflow_model(body)
+
+    body = strip_create_ids(sync_form_model_json(model))
+    strip_task_create_ids(body.get("wfSimpleTaskInfo"))
+    body = finalize_workflow_model(body)
+    body["formModelJson"] = None
     body.setdefault("wfSimpleProc", {})["appId"] = app_id
-    if flow_kind == "complex_recruitment":
-        if strip_complex_tasks or not is_update:
-            strip_task_create_ids(body.get("wfSimpleTaskInfo"))
-        body = finalize_workflow_model(body)
-        if strip_complex_tasks or not is_update:
-            body["formModelJson"] = None
-        return body
+    return body
+
+
+def _prepare_permission_patch_body(
+    local_model: dict,
+    *,
+    platform_tree: dict | None,
+    app_id: str,
+    form_id: str,
+    proc_id: str,
+) -> dict:
+    """权限补写：保留完整本地拓扑 + 平台 id 链，仅覆盖 fromPropertyList；formModelJson=null。"""
+    from core.workflow.shenbi_builder import (
+        _attach_form_permissions,
+        _normalize_form_permissions,
+    )
+
+    local_ready = finalize_workflow_model(copy.deepcopy(local_model))
+    local_tree = local_ready.get("wfSimpleTaskInfo")
+    local_permissions = (
+        copy.deepcopy(local_tree) if isinstance(local_tree, dict) else None
+    )
+
+    if (
+        isinstance(platform_tree, dict)
+        and platform_tree.get("type")
+        and not _complex_task_tree_collapsed(platform_tree)
+    ):
+        body = apply_proc_form_ids_only(local_model, form_id=form_id, proc_id=proc_id)
+        body["wfSimpleTaskInfo"] = copy.deepcopy(platform_tree)
+        if isinstance(local_permissions, dict):
+            merge_local_form_permissions_by_task_key(body["wfSimpleTaskInfo"], local_permissions)
+    else:
+        body = apply_proc_form_ids_only(local_ready, form_id=form_id, proc_id=proc_id)
+        if isinstance(platform_tree, dict) and platform_tree.get("type"):
+            merge_platform_task_tree_inplace(body.get("wfSimpleTaskInfo"), platform_tree)
+        _attach_form_permissions(body)
+        body = _normalize_form_permissions(body)
+
+    body.setdefault("wfSimpleProc", {})["appId"] = app_id
+    prepare_from_property_list_for_platform_save(body.get("wfSimpleTaskInfo"))
+    body["formModelJson"] = None
+    return body
+
+
+def _prepare_full_tree_update_body(
+    model: dict,
+    *,
+    local_tree: dict,
+    app_id: str,
+    form_id: str,
+    proc_id: str,
+) -> dict:
+    """create 空壳后：用完整本地环节树 update 覆盖平台（strip 环节 id 后全量写入）。"""
+    from core.workflow.shenbi_builder import _attach_form_permissions, _normalize_form_permissions
+
+    body = apply_saved_ids(sync_form_model_json(copy.deepcopy(model)), form_id=form_id, proc_id=proc_id)
+    body["wfSimpleTaskInfo"] = copy.deepcopy(local_tree)
+    strip_task_create_ids(body["wfSimpleTaskInfo"])
+    _attach_form_permissions(body)
+    body = _normalize_form_permissions(body)
+    body.setdefault("wfSimpleProc", {})["appId"] = app_id
+    prepare_from_property_list_for_platform_save(body.get("wfSimpleTaskInfo"))
+    body["formModelJson"] = None
     return finalize_workflow_model(body)
+
+
+def _push_full_task_tree_update(
+    model: dict,
+    *,
+    local_tree: dict,
+    app_id: str,
+    form_id: str,
+    proc_id: str,
+    settings: Settings | None,
+    token: str | None,
+    results: list[dict],
+) -> tuple[dict, dict]:
+    """平台环节树空壳时，追加 update save 写入完整 DAG。"""
+    body = _prepare_full_tree_update_body(
+        model,
+        local_tree=local_tree,
+        app_id=app_id,
+        form_id=form_id,
+        proc_id=proc_id,
+    )
+    response = save_proc_model(body, settings=settings, token=token)
+    resp_task = task_tree_from_save_response(response)
+    if isinstance(resp_task, dict) and task_tree_degraded(resp_task, local_tree):
+        response = save_proc_model(body, settings=settings, token=token)
+        resp_task = task_tree_from_save_response(response)
+
+    merged = merge_save_response_preserve_tree(model, response)
+    if isinstance(resp_task, dict) and not task_tree_degraded(resp_task, local_tree):
+        merged["wfSimpleTaskInfo"] = copy.deepcopy(resp_task)
+        results.append(
+            {
+                "step": "环节树补写",
+                "mode": "update",
+                "detail": "已用完整环节树 update 覆盖平台空壳",
+            }
+        )
+    elif local_task_tree_intact(local_tree):
+        merged["wfSimpleTaskInfo"] = copy.deepcopy(local_tree)
+        if isinstance(resp_task, dict):
+            merge_platform_task_ids(merged["wfSimpleTaskInfo"], resp_task)
+            sync_from_property_list_task_ids(merged["wfSimpleTaskInfo"])
+        results.append(
+            {
+                "step": "环节树补写",
+                "mode": "warn",
+                "detail": "环节树 update 后平台仍不完整，请在设计器确认",
+            }
+        )
+    else:
+        results.append(
+            {
+                "step": "环节树补写",
+                "mode": "warn",
+                "detail": "本地环节树不可用，跳过空壳覆盖",
+            }
+        )
+    return merged, response
+
+
+def _patch_form_permissions_after_create(
+    model: dict,
+    *,
+    create_response: dict,
+    app_id: str,
+    form_id: str,
+    proc_id: str,
+    proc_key: str,
+    local_tree: dict | None,
+    settings: Settings | None,
+    token: str | None,
+) -> tuple[dict, dict | None, dict]:
+    """create 后补写 fromPropertyList；须基于完整环节树，否则跳过以免冲垮 ROUTE。"""
+    create_tree = task_tree_from_save_response(create_response)
+    fetched: dict | None = None
+
+    platform_tree: dict | None = None
+    if isinstance(create_tree, dict) and not task_tree_degraded(create_tree, local_tree):
+        platform_tree = create_tree
+    else:
+        if isinstance(create_tree, dict):
+            merge_platform_task_tree_inplace(model.get("wfSimpleTaskInfo"), create_tree)
+        fetched = fetch_platform_model(
+            form_id=form_id,
+            proc_id=proc_id,
+            proc_key=proc_key,
+            app_id=app_id,
+            settings=settings,
+            token=token,
+        )
+        if isinstance(fetched, dict):
+            fetched_tree = fetched.get("wfSimpleTaskInfo")
+            if isinstance(fetched_tree, dict) and not task_tree_degraded(fetched_tree, local_tree):
+                platform_tree = fetched_tree
+
+    tree_for_id = platform_tree if platform_tree is not None else model.get("wfSimpleTaskInfo")
+    if not _start_task_has_platform_id(tree_for_id):
+        return (
+            model,
+            None,
+            {
+                "ok": False,
+                "skipped": True,
+                "message": "跳过权限补写：未拿到 STARTTASK 平台 id，环节树保持 create 结果",
+            },
+        )
+
+    perm_body = _prepare_permission_patch_body(
+        model,
+        platform_tree=platform_tree,
+        app_id=app_id,
+        form_id=form_id,
+        proc_id=proc_id,
+    )
+    if task_tree_degraded(perm_body.get("wfSimpleTaskInfo"), local_tree):
+        return (
+            model,
+            None,
+            {
+                "ok": False,
+                "skipped": True,
+                "message": "跳过权限补写：补写载荷环节树不完整，避免覆盖平台 ROUTE 树",
+            },
+        )
+
+    response = save_proc_model(perm_body, settings=settings, token=token)
+    resp_task = task_tree_from_save_response(response)
+    if isinstance(resp_task, dict) and task_tree_degraded(resp_task, local_tree):
+        raise ShenbiApiError(
+            "权限补写后平台环节树塌陷；请重新一键写入（create 环节树应仍保留，可在设计器确认）"
+        )
+
+    merged = merge_save_response_preserve_tree(model, response)
+    hint = assess_model_save_response(response, local_model=perm_body)
+    hint["ok"] = True
+    return merged, response, hint
 
 
 def save_workflow_models(
@@ -1156,22 +1820,18 @@ def save_workflow_models(
     settings: Settings | None = None,
     token: str | None = None,
     recreate: bool = False,
+    template_mode: bool = False,
+    app_mc: str | None = None,
+    form_slug: str | None = None,
+    sector_title: str | None = None,
+    sector_index: int = 0,
 ) -> dict:
-    """先 ensure 应用，再 model-save 创建/更新表单与流程。
-
-    复杂招聘流程：优先覆盖应用菜单/designer 当前 proc（清空环节 id 后全量写入）；
-    线性流程：registry 有效时 update，formId 失效时自动重建。
-    """
-    settings = settings or get_settings()
-    flow_kind = _workflow_flow_kind(workflow_name)
+    """先 ensure 应用，再 model-save 全量 create 表单与流程（统一写入路径）。"""
+    settings = _sync_settings_tenant(settings or get_settings())
     registry = load_workflow_registry(workflow_name, settings=settings)
-    legacy = is_legacy_registry(registry, settings=settings)
-    if recreate:
-        form_id, proc_id = None, None
-        is_update = False
-    else:
-        form_id, proc_id, _ = resolve_platform_ids(payloads, workflow_name, settings=settings)
-        is_update = bool(form_id and proc_id)
+    if template_mode and not registry_app_verified(registry):
+        registry = None
+    legacy = False if template_mode else is_legacy_registry(registry, settings=settings)
 
     model = payloads.get("model")
     if not isinstance(model, dict):
@@ -1203,48 +1863,86 @@ def save_workflow_models(
         settings=settings,
         token=token,
         registry=registry if registry_app_verified(registry) else None,
+        app_mc=app_mc or payloads.get("app_display_name"),
+        form_slug=form_slug,
+        template_mode=template_mode,
+        sector_title=sector_title,
+        sector_index=sector_index,
     )
     results.append(app_step)
 
-    complex_target_mode = ""
-    if flow_kind == "complex_recruitment" and not recreate:
-        form_id, proc_id = None, None
-        is_update = False
-        complex_target_mode = "create"
-        results.append(
-            {
-                "step": "复杂流程",
-                "mode": "create",
-                "detail": (
-                    "复杂招聘流程全量新建表单/流程并绑定菜单"
-                    "（平台 update 无法恢复已塌陷的环节树）"
-                ),
-            }
-        )
-
     model = finalize_workflow_model(copy.deepcopy(model))
+    normalize_model_tenant_ids(model, settings.shenbi_tenant_id)
+    local_tree_snapshot = copy.deepcopy(model.get("wfSimpleTaskInfo"))
+    min_route_branches = min_route_branches_for_local(local_tree_snapshot)
     model.setdefault("wfSimpleProc", {})["appId"] = app_id
 
-    auto_recreate = False
-    response: dict = {}
-    complex_target_mode = complex_target_mode if flow_kind == "complex_recruitment" else ""
-    strip_complex_tasks = (
-        flow_kind == "complex_recruitment"
-        and (not is_update or complex_target_mode.startswith("overwrite"))
+    use_update = bool(
+        not recreate
+        and registry_app_verified(registry)
+        and registry.get("form_id")
+        and registry.get("proc_id")
+        and registry.get("proc_key")
+        and not legacy
     )
+    full_tree_save_used = False
+    update_form_id = str(registry.get("form_id") or "") if use_update and registry else ""
+    update_proc_id = str(registry.get("proc_id") or "") if use_update and registry else ""
+    update_proc_key = str(registry.get("proc_key") or registry.get("table_name") or "") if use_update and registry else ""
 
-    if is_update:
-        try:
+    if use_update:
+        if isinstance(model.get("formModel"), dict):
+            model["formModel"]["tableName"] = update_proc_key
+            model["formModel"]["formId"] = update_form_id
+        model["wfSimpleProc"]["procKey"] = update_proc_key
+        model["wfSimpleProc"]["id"] = update_proc_id
+        model["wfSimpleProc"]["fromId"] = update_form_id
+        results.append(
+            {
+                "step": "写入策略",
+                "mode": "update",
+                "detail": f"更新已有表单/流程（procKey={update_proc_key}）",
+            }
+        )
+        if local_task_tree_intact(local_tree_snapshot):
+            body = _prepare_full_tree_update_body(
+                model,
+                local_tree=local_tree_snapshot,
+                app_id=app_id,
+                form_id=update_form_id,
+                proc_id=update_proc_id,
+            )
+            full_tree_save_used = True
+        else:
             body = _prepare_model_save_body(
                 model,
                 app_id=app_id,
                 is_update=True,
-                form_id=form_id,
-                proc_id=proc_id,
-                flow_kind=flow_kind,
-                strip_complex_tasks=strip_complex_tasks,
+                form_id=update_form_id,
+                proc_id=update_proc_id,
             )
+        try:
             response = save_proc_model(body, settings=settings, token=token)
+        except ShenbiApiError as exc:
+            if _is_recoverable_model_save_error(exc):
+                use_update = False
+                form_model = model.setdefault("formModel", {})
+                form_model.pop("formId", None)
+                proc = model.setdefault("wfSimpleProc", {})
+                proc.pop("id", None)
+                proc.pop("fromId", None)
+                proc.pop("procKey", None)
+                strip_task_create_ids(model.get("wfSimpleTaskInfo"))
+                results.append(
+                    {
+                        "step": "写入策略",
+                        "mode": "warn",
+                        "detail": "registry 中 form/proc 已失效或租户不匹配（code=13），将改为全量新建",
+                    }
+                )
+            else:
+                raise
+        else:
             save_hint = assess_model_save_response(response, local_model=body)
             results.append(
                 {
@@ -1254,62 +1952,157 @@ def save_workflow_models(
                     "detail": save_hint.get("message"),
                 }
             )
-            if flow_kind == "complex_recruitment" and _response_looks_like_shell(
-                response, min_route_branches=4
-            ):
-                auto_recreate = True
-                results.append(
-                    {
-                        "step": "自动重建",
-                        "mode": "create",
-                        "detail": "检测到平台仍为空壳环节树，将自动新建表单/流程并重新绑定菜单",
-                    }
-                )
-        except ShenbiApiError as exc:
-            if _is_stale_registry_save_error(exc):
-                auto_recreate = True
-                is_update = False
-                results.append(
-                    {
-                        "step": "自动重建",
-                        "mode": "create",
-                        "detail": f"registry 表单/流程已失效，将全量新建：{exc.args[0]}",
-                    }
-                )
-            else:
-                raise
+            model = merge_save_response_preserve_tree(model, response)
 
-    if not is_update or auto_recreate or recreate:
+    if not use_update:
+        results.append(
+            {
+                "step": "写入策略",
+                "mode": "create",
+                "detail": "全量新建表单/流程并绑定菜单（由 DAG 拓扑生成环节树，不区分线性/复杂）",
+            }
+        )
         body = _prepare_model_save_body(
             model,
             app_id=app_id,
             is_update=False,
             form_id=None,
             proc_id=None,
-            flow_kind=flow_kind,
         )
-        response = save_proc_model(body, settings=settings, token=token)
-        save_hint = assess_model_save_response(response, local_model=body)
-        results.append(
-            {
-                "step": "表单与流程" if not (auto_recreate or recreate) else "表单与流程（重建）",
-                "mode": "create",
-                "response": response,
-                "detail": save_hint.get("message"),
-            }
+        model, response = _apply_create_save_with_shell_recovery(
+            model,
+            body,
+            local_tree=local_tree_snapshot,
+            min_route_branches=min_route_branches,
+            settings=settings,
+            token=token,
+            results=results,
+            recreate=recreate,
         )
 
-    model = finalize_workflow_model(merge_save_response_preserve_tree(model, response))
     form_id, proc_id = extract_platform_ids(model)
     if not form_id or not proc_id:
         raise ShenbiApiError("保存后未返回 formId / procId", body=response)
 
-    if flow_kind == "complex_recruitment" and _complex_task_tree_collapsed(
-        model.get("wfSimpleTaskInfo") if isinstance(model.get("wfSimpleTaskInfo"), dict) else None
-    ):
-        raise ShenbiApiError(
-            "复杂流程新建后环节树仍不完整（仅 STARTTASK），请检查 token 或稍后重试一键写入"
+    proc = model.get("wfSimpleProc") if isinstance(model.get("wfSimpleProc"), dict) else {}
+    proc_key = str(proc.get("procKey") or "")
+
+    platform_task = model.get("wfSimpleTaskInfo")
+    resp_task_after_save = task_tree_from_save_response(response)
+    needs_tree_push = (
+        local_task_tree_intact(local_tree_snapshot)
+        and (
+            not response_has_task_tree(response)
+            or (
+                isinstance(resp_task_after_save, dict)
+                and task_tree_degraded(resp_task_after_save, local_tree_snapshot)
+            )
+            or (
+                isinstance(platform_task, dict)
+                and task_tree_degraded(platform_task, local_tree_snapshot)
+            )
         )
+    )
+    if needs_tree_push:
+        model, response = _push_full_task_tree_update(
+            model,
+            local_tree=local_tree_snapshot,
+            app_id=app_id,
+            form_id=str(form_id),
+            proc_id=str(proc_id),
+            settings=settings,
+            token=token,
+            results=results,
+        )
+        full_tree_save_used = True
+        form_id, proc_id = extract_platform_ids(model)
+        proc = model.get("wfSimpleProc") if isinstance(model.get("wfSimpleProc"), dict) else {}
+        proc_key = str(proc.get("procKey") or proc_key)
+
+    tree_after_push = model.get("wfSimpleTaskInfo")
+    resp_task_confirmed = task_tree_from_save_response(response)
+    tree_push_confirmed = (
+        response_has_task_tree(response)
+        and isinstance(resp_task_confirmed, dict)
+        and not task_tree_degraded(resp_task_confirmed, local_tree_snapshot)
+    )
+    skip_permission_patch = bool(
+        full_tree_save_used
+        or tree_push_confirmed
+        or (use_update and local_task_tree_intact(local_tree_snapshot))
+    )
+    permissions_already_on_tree = skip_permission_patch and local_task_tree_intact(local_tree_snapshot)
+
+    try:
+        if permissions_already_on_tree:
+            perm_response = None
+            if full_tree_save_used or (use_update and local_task_tree_intact(local_tree_snapshot)):
+                perm_message = "strip-id 全量环节树已写入，跳过权限补写（避免覆盖设计器环节树）"
+            else:
+                perm_message = "完整环节树已写入平台，跳过二次权限补写"
+            perm_hint = {
+                "ok": True,
+                "skipped": True,
+                "message": perm_message,
+            }
+            model = finalize_workflow_model(model)
+        else:
+            model, perm_response, perm_hint = _patch_form_permissions_after_create(
+                model,
+                create_response=response,
+                app_id=app_id,
+                form_id=str(form_id),
+                proc_id=str(proc_id),
+                proc_key=proc_key,
+                local_tree=local_tree_snapshot,
+                settings=settings,
+                token=token,
+            )
+        perm_mode = "warn" if perm_hint.get("skipped") else "update"
+        results.append(
+            {
+                "step": "表单操作权限",
+                "mode": perm_mode,
+                "response": perm_response,
+                "detail": perm_hint.get("message"),
+            }
+        )
+        if (
+            not perm_hint.get("skipped")
+            and task_tree_degraded(model.get("wfSimpleTaskInfo"), local_tree_snapshot)
+            and local_task_tree_intact(local_tree_snapshot)
+        ):
+            platform_ids_tree = copy.deepcopy(model.get("wfSimpleTaskInfo"))
+            model["wfSimpleTaskInfo"] = copy.deepcopy(local_tree_snapshot)
+            if isinstance(platform_ids_tree, dict):
+                merge_platform_task_ids(model["wfSimpleTaskInfo"], platform_ids_tree)
+            sync_from_property_list_task_ids(model.get("wfSimpleTaskInfo"))
+            results.append(
+                {
+                    "step": "空壳恢复",
+                    "mode": "warn",
+                    "detail": "权限补写后环节树塌陷，已回退为本地环节树（权限可能未完全绑定）",
+                }
+            )
+    except ShenbiApiError as exc:
+        if local_task_tree_intact(local_tree_snapshot):
+            model["wfSimpleTaskInfo"] = copy.deepcopy(local_tree_snapshot)
+            results.append(
+                {
+                    "step": "表单操作权限",
+                    "mode": "warn",
+                    "detail": f"{exc.args[0]}；已保留本地环节树",
+                }
+            )
+        else:
+            results.append(
+                {
+                    "step": "表单操作权限",
+                    "mode": "warn",
+                    "detail": str(exc.args[0]),
+                }
+            )
+            raise
 
     proc = model.get("wfSimpleProc") if isinstance(model.get("wfSimpleProc"), dict) else {}
     proc_key = str(proc.get("procKey") or "")
@@ -1336,12 +2129,14 @@ def save_workflow_models(
     from core.workflow.shenbi_builder import display_workflow_name
 
     menu_title = str(app_mc or display_workflow_name(workflow_name))
-    menu_steps = rebind_all_flow_menus(
-        app_id=app_id,
+    menu_steps = rebind_flow_menus_for_workflow_aliases(
+        workflow_name=workflow_name,
+        primary_app_id=app_id,
         title=menu_title,
         form_id=form_id,
         proc_id=proc_id,
         proc_key=proc_key,
+        registry=registry,
         settings=settings,
         token=token,
     )
@@ -1350,6 +2145,7 @@ def save_workflow_models(
     publish_result = publish_workflow(
         proc_id=proc_id,
         proc_key=proc_key,
+        form_id=form_id,
         app_id=app_id,
         settings=settings,
         token=token,
@@ -1361,6 +2157,45 @@ def save_workflow_models(
         settings=settings,
         token=token,
     )
+    publish_mode = "ok" if publish_result.get("ok") else "warn"
+    runtime_mode = "ok" if runtime_check.get("ok") else "warn"
+    if not session_cookie_configured(settings) and not publish_result.get("ok"):
+        publish_detail = (
+            f"{publish_result.get('message') or '发布未成功'}；"
+            "请在侧边栏填写浏览器 DevTools 中的完整 SESSION Cookie 后重新写入或批量发布。"
+        )
+    else:
+        publish_detail = publish_result.get("message")
+    results.append(
+        {
+            "step": "流程发布",
+            "mode": publish_mode,
+            "detail": publish_detail,
+        }
+    )
+    results.append(
+        {
+            "step": "运行时校验",
+            "mode": runtime_mode,
+            "detail": runtime_check.get("message"),
+        }
+    )
+    if not runtime_check.get("ok"):
+        if session_cookie_configured(settings):
+            raise ShenbiApiError(
+                str(runtime_check.get("message") or publish_result.get("message") or "流程未发布到运行时"),
+                body={"publish": publish_result, "runtime_check": runtime_check},
+            )
+        results.append(
+            {
+                "step": "写入结论",
+                "mode": "warn",
+                "detail": (
+                    "模型已保存，但未能验证运行时发布（未配置有效 SESSION Cookie）。"
+                    "请填写 Cookie 后点击「批量发布流程」。"
+                ),
+            }
+        )
     model_check = verify_model_integrity(model)
     persisted_check = verify_persisted_model(
         form_id=form_id,
@@ -1388,12 +2223,24 @@ def save_workflow_models(
         }
     )
 
-    if flow_kind == "complex_recruitment":
+    if task_tree_has_routes(local_tree_snapshot):
         write_outcome = assess_complex_write_outcome(
             save_response=response,
             local_model=model,
             persisted_check=persisted_check,
         )
+        if write_outcome["level"] == "warn" or (
+            write_outcome["level"] == "error" and local_task_tree_intact(local_tree_snapshot)
+        ):
+            if write_outcome["level"] == "error":
+                write_outcome = {
+                    **write_outcome,
+                    "ok": True,
+                    "level": "warn",
+                    "message": (
+                        f"{write_outcome['message']}；本地环节树完整，已保留并在设计器绑定菜单"
+                    ),
+                }
         if write_outcome["level"] == "warn":
             persisted_check = {
                 **persisted_check,
@@ -1413,7 +2260,7 @@ def save_workflow_models(
     return {
         "model": model,
         "results": results,
-        "is_update": is_update,
+        "is_update": use_update,
         "form_id": form_id,
         "proc_id": proc_id,
         "proc_key": proc_key,
@@ -1421,6 +2268,7 @@ def save_workflow_models(
         "app_mc": app_mc,
         "publish": publish_result,
         "runtime_check": runtime_check,
+        "runtime_ready": bool(runtime_check.get("ok")),
         "model_check": model_check,
         "persisted_check": persisted_check,
     }
@@ -1435,6 +2283,77 @@ def _response_data_ok(data: Any) -> bool:
     if isinstance(data, dict) and not data:
         return False
     return True
+
+
+def session_cookie_configured(settings: Settings | None = None) -> bool:
+    """是否配置了可用于发布/运行时查询的有效浏览器 Cookie。"""
+    settings = settings or get_settings()
+    cookie = (settings.shenbi_session_cookie or "").strip()
+    if not cookie:
+        return False
+    normalized = cookie.replace(" ", "")
+    if normalized in {"SESSION=SESSION", "SESSION"}:
+        return False
+    if "SESSION=" in cookie and len(normalized) > len("SESSION=") + 8:
+        return True
+    return len(normalized) > 24
+
+
+def probe_publish_capability(
+    *,
+    settings: Settings | None = None,
+    token: str | None = None,
+    workflow_name: str | None = None,
+) -> dict:
+    """探测当前 token + Cookie 能否发布/查询运行时流程。"""
+    settings = settings or get_settings()
+    token = _resolve_token(token, settings)
+    result = {
+        "cookie_configured": session_cookie_configured(settings),
+        "publish_ok": False,
+        "runtime_ok": False,
+        "message": "",
+    }
+    if not token:
+        result["message"] = "未配置 token"
+        return result
+    if not result["cookie_configured"]:
+        result["message"] = "SESSION Cookie 仍为占位值；将尝试仅用 token 发布（可能失败，建议填写 Cookie）"
+    registry = None
+    if workflow_name:
+        registry = load_workflow_registry(workflow_name, settings=settings)
+    if not registry:
+        for key in ("集团费用报销单", "外贸集团样车合同备案表", "野马集团二线招聘需求表"):
+            registry = load_workflow_registry(key, settings=settings)
+            if registry:
+                break
+    if not registry:
+        result["message"] = "无本地 registry，请先完成至少一次流程写入"
+        return result
+    publish = publish_workflow(
+        proc_id=str(registry["proc_id"]),
+        proc_key=str(registry.get("proc_key") or registry.get("table_name") or ""),
+        form_id=str(registry.get("form_id") or ""),
+        app_id=str(registry.get("app_id") or ""),
+        settings=settings,
+        token=token,
+    )
+    runtime = verify_runtime_proc(
+        proc_key=str(registry.get("proc_key") or registry.get("table_name") or ""),
+        proc_id=str(registry.get("proc_id") or ""),
+        app_id=str(registry.get("app_id") or ""),
+        settings=settings,
+        token=token,
+    )
+    result["publish_ok"] = bool(publish.get("ok"))
+    result["runtime_ok"] = bool(runtime.get("ok"))
+    if result["runtime_ok"]:
+        result["message"] = "发布与运行时查询正常，可批量写入"
+    elif result["publish_ok"]:
+        result["message"] = "发布接口成功，但运行时仍未命中（请确认 Cookie 与 token 同一会话）"
+    else:
+        result["message"] = publish.get("message") or runtime.get("message") or "发布探测失败"
+    return result
 
 
 def verify_model_integrity(model: dict) -> dict:
@@ -1513,7 +2432,7 @@ def verify_persisted_model(
 ) -> dict:
     """尝试 model-get 回读平台已存流程，与本地环节拓扑对比。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     local_types = verify_model_integrity(local_model).get("task_types") or {}
 
     if not token:
@@ -1556,9 +2475,16 @@ def verify_persisted_model(
                     **last,
                 }
             if not _response_data_ok(data):
+                if session_cookie_configured(settings):
+                    return {
+                        "ok": False,
+                        "message": "平台 model-get 未返回流程数据（formId/procId 可能无效或未发布）",
+                        "local_task_types": local_types,
+                        **last,
+                    }
                 return {
                     "ok": bool(local_types),
-                    "message": "平台 model-get data 为空，以本地模型为准",
+                    "message": "平台 model-get data 为空（未配置 SESSION Cookie，无法确认平台侧是否已持久化）",
                     "local_task_types": local_types,
                     **last,
                 }
@@ -1608,15 +2534,17 @@ def verify_runtime_proc(
 ) -> dict:
     """查询运行时流程定义是否可加载（工作台菜单依赖此数据）。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     if not token:
         return {"ok": False, "message": "未配置 token"}
 
     base = settings.shenbi_base_url.rstrip("/")
     headers = _api_headers(token, settings=settings)
+    tenant_id = settings.shenbi_tenant_id
     body: dict[str, Any] = {
         "procKey": proc_key,
         "appId": app_id or settings.shenbi_app_id,
+        "tenantId": tenant_id,
     }
     if proc_id:
         body["procId"] = proc_id
@@ -1626,6 +2554,7 @@ def verify_runtime_proc(
         "/fighter-baida/api/flow-simple/proc/getProcDef",
         "/fighter-baida/api/flow-simple/proc/getByKey",
         "/fighter-baida/api/flow-simple/proc/detail",
+        "/fighter-baida/api/flow-simple/proc/getProcDefByKey",
     )
     last: dict | None = None
     try:
@@ -1663,44 +2592,125 @@ def publish_workflow(
     *,
     proc_id: str,
     proc_key: str,
+    form_id: str | None = None,
     app_id: str | None = None,
     settings: Settings | None = None,
     token: str | None = None,
 ) -> dict:
     """发布流程到运行时（工作台发起/审批依赖此步骤）。"""
-    settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    settings = _sync_settings_tenant(settings or get_settings())
+    token = _resolve_token(token, settings)
     if not token:
         return {"ok": False, "message": "未配置 token，跳过发布"}
 
     base = settings.shenbi_base_url.rstrip("/")
-    url = f"{base}{PUBLISH_PATH}"
     headers = _api_headers(token, settings=settings)
-    body = {
-        "procId": proc_id,
-        "id": proc_id,
-        "procKey": proc_key,
-        "appId": app_id or settings.shenbi_app_id,
-        "tenantId": settings.shenbi_tenant_id,
-    }
+    tenant_id = settings.shenbi_tenant_id
+    app = app_id or settings.shenbi_app_id
+    bodies: list[dict[str, Any]] = [
+        {
+            "procId": proc_id,
+            "id": proc_id,
+            "procKey": proc_key,
+            "appId": app,
+            "tenantId": tenant_id,
+        },
+        {"procId": proc_id, "procKey": proc_key, "appId": app, "tenantId": tenant_id},
+        {"id": proc_id, "procKey": proc_key, "tenantId": tenant_id},
+        {"procKey": proc_key, "appId": app, "tenantId": tenant_id},
+    ]
+    if form_id:
+        for body in bodies[:2]:
+            body["formId"] = form_id
+
+    last: dict[str, Any] = {}
+    paths = (PUBLISH_PATH, *PUBLISH_ALT_PATHS)
     try:
         with _http_client(settings=settings, timeout=60.0) as client:
-            resp = client.post(url, json=body, headers=headers)
+            for path in paths:
+                url = f"{base}{path}"
+                for body in bodies:
+                    resp = client.post(url, json=body, headers=headers)
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        payload = {"raw": resp.text}
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    last = {
+                        "endpoint": path,
+                        "code": code,
+                        "data": data,
+                        "body": payload,
+                    }
+                    if code in (401, "401"):
+                        continue
+                    ok = code in SUCCESS_CODES and _response_data_ok(data)
+                    message = _explain_api_code(payload) if isinstance(payload, dict) else str(payload)
+                    if code in SUCCESS_CODES and not _response_data_ok(data):
+                        if session_cookie_configured(settings):
+                            message = (
+                                "发布接口返回 code=200 但 data 为空，流程未发布到运行时。"
+                                "请确认 SESSION Cookie 与 fighter-auth-token 来自同一浏览器会话。"
+                            )
+                        else:
+                            message = (
+                                "发布接口返回 code=200 但 data 为空，流程可能未发布到运行时。"
+                                "请在流程写入页侧边栏填写浏览器 DevTools 中的完整 SESSION Cookie 后重新写入。"
+                            )
+                    if ok:
+                        return {
+                            "ok": True,
+                            "code": code,
+                            "data": data,
+                            "message": message or "流程已发布到运行时",
+                            "body": payload,
+                            **last,
+                        }
+                # 部分环境支持 GET 发布
+                get_url = f"{url}?procId={proc_id}&procKey={proc_key}&appId={app}"
+                if form_id:
+                    get_url += f"&formId={form_id}"
+                resp = client.get(get_url, headers=headers)
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = {"raw": resp.text}
+                code = payload.get("code") if isinstance(payload, dict) else None
+                data = payload.get("data") if isinstance(payload, dict) else None
+                last = {"endpoint": f"GET {path}", "code": code, "data": data, "body": payload}
+                if code in SUCCESS_CODES and _response_data_ok(data):
+                    return {
+                        "ok": True,
+                        "code": code,
+                        "data": data,
+                        "message": "流程已发布到运行时（GET）",
+                        "body": payload,
+                        **last,
+                    }
     except httpx.ConnectError as exc:
         return {"ok": False, "message": f"发布请求连接失败：{exc}"}
 
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = {"raw": resp.text}
-    code = payload.get("code") if isinstance(payload, dict) else None
-    data = payload.get("data") if isinstance(payload, dict) else None
+    code = last.get("code")
+    data = last.get("data")
+    payload = last.get("body") if isinstance(last.get("body"), dict) else {}
     ok = code in SUCCESS_CODES and _response_data_ok(data)
     message = _explain_api_code(payload) if isinstance(payload, dict) else str(payload)
     if code in SUCCESS_CODES and not _response_data_ok(data):
+        if session_cookie_configured(settings):
+            message = (
+                "发布接口返回 code=200 但 data 为空，流程未发布到运行时。"
+                "请确认 SESSION Cookie 与 fighter-auth-token 来自同一浏览器会话。"
+            )
+        else:
+            message = (
+                "发布接口返回 code=200 但 data 为空，流程可能未发布到运行时。"
+                "请在流程写入页侧边栏填写浏览器 DevTools 中的完整 SESSION Cookie 后重新写入。"
+            )
+    elif code in (401, "401"):
         message = (
-            "发布接口返回 code=200 但 data 为空，流程可能未发布到运行时。"
-            "请在设计器手动点击「发布」，或配置真实 SESSION Cookie 后重试。"
+            "发布失败：登录信息失效。"
+            "请确认 fighter-auth-token 有效，并在侧边栏填写与 token 同一会话的 SESSION Cookie。"
         )
     return {
         "ok": ok,
@@ -1708,13 +2718,14 @@ def publish_workflow(
         "data": data,
         "message": message,
         "body": payload,
+        **last,
     }
 
 
 def check_shenbi_auth(*, settings: Settings | None = None, token: str | None = None) -> dict:
     """检测 token 是否有效，并探测 model-save 是否可用。"""
     settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    token = _resolve_token(token, settings)
     result = {
         "token_present": bool(token),
         "auth_ok": False,
@@ -1770,7 +2781,130 @@ def check_shenbi_auth(*, settings: Settings | None = None, token: str | None = N
             result["save_probe_code"] = code
             result["save_probe_message"] = msg
             result["save_probe_body_len"] = len(save_resp.request.content or b"")
+    probe = probe_publish_capability(settings=settings, token=token)
+    result["publish_ok"] = probe.get("publish_ok")
+    result["runtime_ok"] = probe.get("runtime_ok")
+    result["publish_message"] = probe.get("message") or (
+        "未配置有效 SESSION Cookie；写入后请在侧边栏填写 Cookie 并点击「批量发布流程」"
+    )
     return result
+
+
+def republish_workflow_from_registry(
+    workflow_name: str,
+    *,
+    settings: Settings | None = None,
+    token: str | None = None,
+) -> dict:
+    """仅重新绑定菜单并发布已有 registry 流程到运行时（修复「查无该流程定义信息」）。"""
+    settings = _sync_settings_tenant(settings or get_settings())
+    registry = load_workflow_registry(workflow_name, settings=settings)
+    if not registry_app_verified(registry):
+        raise ShenbiApiError(f"未找到已验证 registry：{workflow_name}")
+    app_id = str(registry.get("app_id") or "")
+    form_id = str(registry.get("form_id") or "")
+    proc_id = str(registry.get("proc_id") or "")
+    proc_key = str(registry.get("proc_key") or registry.get("table_name") or "")
+    app_mc = str(registry.get("app_mc") or "")
+    if not all([app_id, form_id, proc_id, proc_key]):
+        raise ShenbiApiError(f"registry 缺少 app/form/proc 信息：{workflow_name}")
+
+    menu_steps = rebind_flow_menus_for_workflow_aliases(
+        workflow_name=workflow_name,
+        primary_app_id=app_id,
+        title=app_mc or workflow_name,
+        form_id=form_id,
+        proc_id=proc_id,
+        proc_key=proc_key,
+        registry=registry,
+        settings=settings,
+        token=token,
+    )
+    publish_result = publish_workflow(
+        proc_id=proc_id,
+        proc_key=proc_key,
+        form_id=form_id,
+        app_id=app_id,
+        settings=settings,
+        token=token,
+    )
+    runtime_check = verify_runtime_proc(
+        proc_key=proc_key,
+        proc_id=proc_id,
+        app_id=app_id,
+        settings=settings,
+        token=token,
+    )
+    if not runtime_check.get("ok"):
+        hint = str(runtime_check.get("message") or publish_result.get("message") or "流程发布到运行时失败")
+        if not session_cookie_configured(settings):
+            hint = (
+                "发布/运行时校验需要浏览器 SESSION Cookie（不能为 SESSION=SESSION 占位值）。"
+                "请登录 ym.zhiduo.net 后，从 DevTools → Network 复制完整 Cookie 到流程写入页侧边栏，再点「批量发布流程」。"
+            )
+        raise ShenbiApiError(
+            hint,
+            body={"publish": publish_result, "runtime_check": runtime_check, "menu_steps": menu_steps},
+        )
+    return {
+        "workflow_name": workflow_name,
+        "app_id": app_id,
+        "proc_id": proc_id,
+        "proc_key": proc_key,
+        "menu_steps": menu_steps,
+        "publish": publish_result,
+        "runtime_check": runtime_check,
+    }
+
+
+def list_verified_registries(*, settings: Settings | None = None) -> list[tuple[str, dict]]:
+    """扫描 output/workflows/shenbi 下全部已验证 registry。"""
+    settings = settings or get_settings()
+    root = settings.output_dir / "workflows" / "shenbi"
+    if not root.is_dir():
+        return []
+    items: list[tuple[str, dict]] = []
+    for path in sorted(root.glob("*_registry.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not registry_app_verified(data):
+            continue
+        name = str(data.get("workflow_name") or path.stem.replace("_registry", ""))
+        items.append((name, data))
+    return items
+
+
+def republish_all_registries(
+    *,
+    settings: Settings | None = None,
+    token: str | None = None,
+    on_progress: Any | None = None,
+) -> dict:
+    """批量发布本地 registry 流程到运行时（修复已写入但未发布的流程）。"""
+    settings = _sync_settings_tenant(settings or get_settings())
+    registries = list_verified_registries(settings=settings)
+    total = len(registries)
+    succeeded: list[dict] = []
+    failed: list[dict] = []
+    for idx, (name, _reg) in enumerate(registries, start=1):
+        if on_progress:
+            on_progress(idx - 1, total, name)
+        try:
+            result = republish_workflow_from_registry(name, settings=settings, token=token)
+            succeeded.append({"workflow_name": name, **result})
+        except Exception as exc:
+            failed.append({"workflow_name": name, "error": str(exc)})
+        if on_progress:
+            on_progress(idx, total, name)
+    return {
+        "total": total,
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+        "items_ok": succeeded,
+        "items_fail": failed,
+    }
 
 
 def _remote_task_tree_populated(remote_types: dict | None, *, min_usertask: int = 8) -> bool:
@@ -1842,6 +2976,33 @@ def response_has_task_tree(response: dict) -> bool:
     return isinstance(task, dict) and bool(task.get("type"))
 
 
+def write_result_tree_confirmed(
+    write_result: dict,
+    *,
+    local_model: dict | None = None,
+) -> bool:
+    """写入结果中 model-save 是否回传与本地一致的完整环节树。"""
+    from core.workflow.flow_topology import local_task_tree_intact, task_tree_degraded
+
+    local_tree = None
+    if isinstance(local_model, dict):
+        local_tree = local_model.get("wfSimpleTaskInfo")
+    for step in write_result.get("results") or []:
+        if step.get("step") not in {"表单与流程", "环节树补写"}:
+            continue
+        response = step.get("response")
+        if not response_has_task_tree(response or {}):
+            continue
+        remote = task_tree_from_save_response(response)
+        if not isinstance(remote, dict):
+            continue
+        if isinstance(local_tree, dict) and local_task_tree_intact(local_tree):
+            if task_tree_degraded(remote, local_tree):
+                continue
+        return True
+    return False
+
+
 def local_model_has_task_tree(model: dict) -> bool:
     task = model.get("wfSimpleTaskInfo")
     return isinstance(task, dict) and bool(task.get("type"))
@@ -1860,11 +3021,12 @@ class ShenbiApiError(RuntimeError):
 
 def save_proc_model(payload: dict, *, settings: Settings | None = None, token: str | None = None) -> dict:
     """调用 model-save 接口保存流程模型。"""
-    settings = settings or get_settings()
-    token = (token or settings.shenbi_api_token or "").strip()
+    settings = _sync_settings_tenant(settings or get_settings())
+    token = _resolve_token(token, settings)
     if not token:
         raise ShenbiApiError("未配置神笔平台 token（fighter-auth-token）")
 
+    normalize_model_tenant_ids(payload, settings.shenbi_tenant_id)
     base = settings.shenbi_base_url.rstrip("/")
     url = f"{base}{MODEL_SAVE_PATH}"
     headers = _api_headers(token, settings=settings)

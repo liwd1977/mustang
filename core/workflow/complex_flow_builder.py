@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from core.config.settings import Settings
+from core.workflow.flow_semantics import strip_person_name
 
 # 招聘需求：分支判断字段
 ZPBM_FIELD = "zpbm"
@@ -39,6 +40,85 @@ ZWJB_MANAGER_DOWN = [ZWJB_OPTIONS[0], ZWJB_OPTIONS[1]]
 # 「是审计部」→ 集团审计部(value=6)；「不是审计部」→ 其余部门（与流程图语义一致）
 ZPBM_IS_AUDIT = [{"label": "集团审计部", "value": "6"}]
 ZPBM_NOT_AUDIT = [o for o in ZPBM_OPTIONS if o["value"] != "6"]
+
+# 集团费用报销单：分支判断字段
+FYSY_FIELD = "fysy"
+SFZCB_FIELD = "sfzcb"
+JEFD_FIELD = "jefd"
+SFSJB_FIELD = "sfsjb"
+CNLX_FIELD = "cnlx"
+FYLX_FIELD = "fylx"
+ZGS_FIELD = "zgs"
+SLYZ_FIELD = "slyz"
+FXWZ_FIELD = "fxwz"
+
+FYSY_PROCUREMENT = {"label": "采购费用", "value": "0"}
+FYSY_NON_PROCUREMENT = {"label": "非采购费用", "value": "1"}
+SFZCB_YES = {"label": "是", "value": "1"}
+SFZCB_NO = {"label": "否", "value": "0"}
+JEFD_LT_10K = {"label": "小于1万", "value": "0"}
+JEFD_GTE_10K = {"label": "大于等于1万", "value": "1"}
+SFSJB_YES = {"label": "是", "value": "1"}
+SFSJB_NO = {"label": "否", "value": "0"}
+CNLX_OPTIONS: list[dict[str, str]] = [
+    {"label": "银行出纳", "value": "0"},
+    {"label": "外勤出纳", "value": "1"},
+]
+FYLX_DAILY = {"label": "日常支付", "value": "0"}
+FYLX_MAJOR = {"label": "重大事项", "value": "1"}
+
+# 采购借款：子公司 / 丝路驿站（含连线标签「其他」「龙馆」）
+ZGS_BRANCH_OPTIONS: list[dict[str, str]] = [
+    {"label": "其他", "value": "0"},
+    {"label": "马业部", "value": "1"},
+    {"label": "丝路驿站", "value": "2"},
+]
+SLYZ_BRANCH_OPTIONS: list[dict[str, str]] = [
+    {"label": "龙馆", "value": "0"},
+    {"label": "其他", "value": "1"},
+    {"label": "料场/马背/餐饮", "value": "2"},
+]
+
+# 采购借款：部门名称 5 路 + 部门下丝路驿站 2 路
+BMMC_FIELD = "bmmc"
+BMMC_BRANCH_OPTIONS: list[dict[str, str]] = [
+    {"label": "物业公司", "value": "0"},
+    {"label": "其他", "value": "1"},
+    {"label": "工坊文化创意", "value": "2"},
+    {"label": "丝路驿站", "value": "3"},
+    {"label": "餐饮管理公司", "value": "4"},
+]
+BMMC_SLYZ_BRANCH_OPTIONS: list[dict[str, str]] = [
+    {"label": "其他", "value": "0"},
+    {"label": "料场/马背/餐饮", "value": "1"},
+]
+
+# 外贸板块费用报销
+SFSCGB_FIELD = "sfscgb"
+SFSCGB_YES = {"label": "是", "value": "1"}
+SFSCGB_NO = {"label": "否", "value": "0"}
+FT_FYBM_BRANCH_OPTIONS: list[dict[str, str]] = [
+    {"label": "博亚/进出口", "value": "0"},
+    {"label": "欧亚/供应链/集团", "value": "1"},
+    {"label": "震宇/山水/喀什/木业", "value": "2"},
+]
+# 表单下拉：具体公司名；value 与分支 ROUTE 对齐（非角色，仅 select 字段）
+FT_FYBM_FORM_OPTIONS: list[dict[str, str]] = [
+    {"label": "新疆野马博亚商贸有限公司", "value": "0"},
+    {"label": "新疆野马进出口有限公司", "value": "0"},
+    {"label": "新疆野马欧亚人力资源服务有限公司", "value": "1"},
+    {"label": "新疆野马供应链管理有限公司", "value": "1"},
+    {"label": "野马集团有限公司", "value": "1"},
+    {"label": "乌鲁木齐震宇环球商贸有限公司", "value": "2"},
+    {"label": "新疆山水新能源有限公司", "value": "2"},
+    {"label": "喀什野马进出口贸易有限公司", "value": "2"},
+    {"label": "新疆野马木业有限公司", "value": "2"},
+]
+FT_FYBM_OPTIONS = FT_FYBM_BRANCH_OPTIONS
+FT_CASHIER_DEPT_OPTIONS: list[dict[str, str]] = [
+    {"label": "集团/震宇", "value": "0"},
+    {"label": "其他费用主体", "value": "1"},
+]
 
 
 def _now_str() -> str:
@@ -97,6 +177,155 @@ def recruitment_branch_form_fields() -> list[dict[str, Any]]:
             "span": 12,
         },
     ]
+
+
+def _select_field(
+    *,
+    prop: str,
+    label: str,
+    options: list[dict[str, str]],
+    used: set[str] | None = None,
+) -> dict[str, Any]:
+    if used is not None:
+        used.add(prop)
+    return {
+        "cascaderItem": [],
+        "dicData": options,
+        "display": True,
+        "dataType": "varchar",
+        "rules": [],
+        "label": label,
+        "type": "select",
+        "dynamicHide": [],
+        "props": {},
+        "filter": {"dynamic": []},
+        "indb": True,
+        "prop": prop,
+        "localDic": [],
+        "bodyData": [],
+        "isBodyParams": False,
+        "dicFlag": True,
+        "virtualize": True,
+        "dicOption": "1",
+        "span": 12,
+    }
+
+
+def expense_branch_form_fields(*, existing_labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """费用报销复杂流程分支字段；OA 已有同名字段时由 shenbi_builder 跳过重复注入。"""
+    existing = existing_labels or set()
+    cols: list[dict[str, Any]] = []
+    used: set[str] = set()
+
+    def maybe(prop: str, label: str, options: list[dict[str, str]]) -> None:
+        if label in existing:
+            return
+        cols.append(_select_field(prop=prop, label=label, options=options, used=used))
+
+    maybe(FYSY_FIELD, "费用事由", [FYSY_PROCUREMENT, FYSY_NON_PROCUREMENT])
+    maybe(SFZCB_FIELD, "是否总裁办", [SFZCB_YES, SFZCB_NO])
+    maybe(JEFD_FIELD, "金额分段", [JEFD_LT_10K, JEFD_GTE_10K])
+    maybe(SFSJB_FIELD, "是否审计部", [SFSJB_YES, SFSJB_NO])
+    maybe(CNLX_FIELD, "出纳类型", CNLX_OPTIONS)
+    return cols
+
+
+def amount_branch_form_fields(*, existing_labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """仅金额分段分支字段（领借款/子公司报销等 serial_dag）。"""
+    existing = existing_labels or set()
+    cols: list[dict[str, Any]] = []
+    used: set[str] = set()
+
+    def maybe(prop: str, label: str, options: list[dict[str, str]]) -> None:
+        if label in existing:
+            return
+        cols.append(_select_field(prop=prop, label=label, options=options, used=used))
+
+    maybe(JEFD_FIELD, "金额分段", [JEFD_LT_10K, JEFD_GTE_10K])
+    return cols
+
+
+def expense_type_branch_form_fields(*, existing_labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """费用类型分支字段（子公司费用报销等 serial_dag）。"""
+    existing = existing_labels or set()
+    cols: list[dict[str, Any]] = []
+    used: set[str] = set()
+
+    def maybe(prop: str, label: str, options: list[dict[str, str]]) -> None:
+        if label in existing:
+            return
+        cols.append(_select_field(prop=prop, label=label, options=options, used=used))
+
+    maybe(FYLX_FIELD, "费用类型", [FYLX_DAILY, FYLX_MAJOR])
+    return cols
+
+
+def subsidiary_branch_form_fields(*, existing_labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """子公司 / 丝路驿站嵌套分支字段（采购借款等）。"""
+    existing = existing_labels or set()
+    cols: list[dict[str, Any]] = []
+    used: set[str] = set()
+
+    def maybe(prop: str, label: str, options: list[dict[str, str]]) -> None:
+        if label in existing:
+            return
+        cols.append(_select_field(prop=prop, label=label, options=options, used=used))
+
+    maybe(ZGS_FIELD, "子公司", ZGS_BRANCH_OPTIONS)
+    maybe(SLYZ_FIELD, "丝路驿站", SLYZ_BRANCH_OPTIONS)
+    maybe(JEFD_FIELD, "金额分段", [JEFD_LT_10K, JEFD_GTE_10K])
+    maybe(BMMC_FIELD, "部门名称", BMMC_BRANCH_OPTIONS)
+    return cols
+
+
+def foreign_trade_expense_branch_form_fields(*, existing_labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """外贸板块费用报销分支字段。"""
+    existing = existing_labels or set()
+    cols: list[dict[str, Any]] = []
+    used: set[str] = set()
+
+    def maybe(prop: str, label: str, options: list[dict[str, str]]) -> None:
+        if label in existing:
+            return
+        cols.append(_select_field(prop=prop, label=label, options=options, used=used))
+
+    maybe(SFSCGB_FIELD, "是否采购部", [SFSCGB_YES, SFSCGB_NO])
+    maybe("fybm", "费用部门", FT_FYBM_FORM_OPTIONS)
+    maybe(JEFD_FIELD, "金额分段", [JEFD_LT_10K, JEFD_GTE_10K])
+    maybe("fycb", "费用出纳部门", FT_CASHIER_DEPT_OPTIONS)
+    return cols
+
+
+def ensure_fybm_select_field(form_info_cols: list[dict], *, used_props: set[str]) -> bool:
+    """
+    将 OA 已有「费用部门」字段升级为分支 select（prop=fybm，含具体公司选项）。
+    发起人自选费用部门：仅表单字段，无对应审批环节。
+    """
+    for col in form_info_cols:
+        if str(col.get("label") or "") != "费用部门":
+            continue
+        old_prop = str(col.get("prop") or "")
+        if old_prop and old_prop != "fybm":
+            used_props.discard(old_prop)
+        template = _select_field(prop="fybm", label="费用部门", options=FT_FYBM_FORM_OPTIONS)
+        col.update(template)
+        col["display"] = True
+        used_props.add("fybm")
+        return True
+    return False
+
+
+def branch_field_props_in_tree(task_root: dict | None) -> set[str]:
+    props: set[str] = set()
+    for task in iter_all_tasks(task_root):
+        if task.get("type") != "BRANCHTASK":
+            continue
+        properties = task.get("properties") if isinstance(task.get("properties"), dict) else {}
+        for cond in properties.get("branchConditionList") or []:
+            prop = cond.get("fieldProp")
+            if prop:
+                props.add(str(prop))
+    return props
 
 
 def iter_all_tasks(root: dict | None) -> list[dict]:
@@ -237,6 +466,29 @@ class _FlowCtx:
             task_key=task_key,
         )
 
+    def usertask_from_guide(
+        self,
+        pid: str | None,
+        content: str,
+        *,
+        index: int,
+        sort: int = 0,
+    ) -> dict[str, Any]:
+        """指南处理节点 → USERTASK（含发起人自选 assignMember）。"""
+        from core.workflow.flow_semantics import usertask_spec_from_guide_content
+        from core.workflow.guide_dag_compiler import _task_key_from_name
+
+        task_name, assign = usertask_spec_from_guide_content(content)
+        key = _task_key_from_name(task_name, index=index)
+        while key in self.used_keys:
+            key = f"{key}_{index}"
+        node = self.usertask(pid, task_name=task_name[:60], task_key=key, sort=sort)
+        if assign:
+            if not isinstance(node.get("properties"), dict):
+                node["properties"] = {}
+            node["properties"]["personList"] = [{"personType": "assignMember"}]
+        return node
+
     def cctask(
         self,
         pid: str | None,
@@ -312,7 +564,7 @@ def _build_cc_chain(ctx: _FlowCtx, recipients: list[str]) -> dict | None:
 
 
 def _cc_task_name(recipient: str) -> str:
-    text = (recipient or "").strip()
+    text = strip_person_name((recipient or "").strip())
     text = re.sub(r"^抄送\s*", "", text)
     if not text:
         return "抄送"
@@ -322,12 +574,9 @@ def _cc_task_name(recipient: str) -> str:
 
 
 def _cc_task_key(task_name: str, index: int) -> str:
-    import hashlib
+    from core.form.name_utils import task_key_from_name
 
-    ascii_part = re.sub(r"[^\w]", "", task_name.encode("ascii", "ignore").decode())
-    if ascii_part:
-        return f"{ascii_part[:20].lower()}_{index}"
-    return f"cc_{hashlib.md5(task_name.encode()).hexdigest()[:8]}"
+    return task_key_from_name(task_name, index=index, prefix="cc")
 
 
 def _build_tail_after_merge(

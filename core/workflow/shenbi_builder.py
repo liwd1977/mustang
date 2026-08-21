@@ -12,19 +12,46 @@ from pathlib import Path
 from typing import Any
 
 from core.config.settings import Settings, get_settings
+from core.config.shenbi_environments import get_shenbi_config
 from core.form.form_store import load_form
-from core.form.name_utils import normalize_workflow_name, string_similarity
+from core.form.name_utils import (
+    clamp_platform_field_name,
+    display_app_name,
+    display_form_name,
+    display_workflow_name,
+    is_valid_ascii_prop,
+    normalize_workflow_name,
+    string_similarity,
+    task_key_from_name,
+)
+from core.workflow.flow_topology import is_expense_task_tree_source, is_recruitment_task_tree_source
 from core.workflow.guide_dag_compiler import compile_task_tree_from_guide, summarize_recruitment_branch_plans
+from core.workflow.expense_flow_compiler import summarize_expense_branch_bindings
 from core.workflow.complex_flow_builder import (
     iter_all_tasks,
     recruitment_branch_form_fields,
+    expense_branch_form_fields,
+    foreign_trade_expense_branch_form_fields,
+    ensure_fybm_select_field,
+    amount_branch_form_fields,
+    expense_type_branch_form_fields,
+    subsidiary_branch_form_fields,
+    branch_field_props_in_tree,
+    JEFD_FIELD,
+    FYLX_FIELD,
+    ZGS_FIELD,
+    SLYZ_FIELD,
 )
 from core.workflow.flow_semantics import (
     SemanticStep,
+    SelfSelectFieldSpec,
+    collect_self_select_field_specs,
+    collect_self_select_cc_specs,
     guide_nodes_to_semantic_steps,
     semantic_steps_summary,
 )
-from core.workflow.result_store import ensure_guide_parse_fresh, load_result
+from core.workflow.result_store import load_result, resolve_parsed_flow
+from core.workflow.workflow_catalog import WORKFLOW_CATALOG, get_catalog_hints, get_catalog_meta
 from schemas.form import RawFormRecord
 from schemas.workflow import WorkflowFlowResult, WorkflowNodeItem
 
@@ -37,52 +64,20 @@ SYSTEM_READONLY_PROPS = frozenset(
     {"id", "processInstanceId", "taskId", "creator", "createTime", "lastUpdator", "lastUpdateTime", "orgId", "processCode", "fqr"}
 )
 
-# 汇聚后链：职务级别在审批环节可读（与神笔样例一致）
-_RECRUITMENT_ZWJB_READABLE_KEYS = frozenset(
-    {"ymjtzjlsp", "ymjtzcsp", "ymjtzcbfzrsp", "ymjtrsjlsp", "csymjtzjl"}
+# 表单设计器 display=false 的系统字段：权限列表中不包含（手工 save 规律）
+HIDDEN_FORM_FIELD_PROPS = frozenset(
+    {"id", "processInstanceId", "taskId", "creator", "createTime", "lastUpdator", "lastUpdateTime"}
 )
 
-WORKFLOW_CATALOG: dict[str, dict[str, str | list[str]]] = {
-    "外贸集团样车合同备案表": {
-        "form_slug": "外贸集团样车合同备案表",
-        "guide_flow_hints": [
-            "外贸集团样车合同备案",
-            "外贸集团样车合同备案表",
-            "样车合同备案",
-        ],
-    },
-    "野马集团二线招聘需求表": {
-        "form_slug": "野马集团二线部门招聘需求表",
-        "flow_kind": "complex_recruitment",
-        "guide_flow_hints": [
-            "野马集团二线招聘需求表（已核对）",
-            "野马集团二线招聘需求表",
-            "野马集团二线招聘需求",
-            "二线招聘需求",
-        ],
-    },
-}
+# 职务级别 zwjb：STARTTASK 可填；USERTASK 与表单信息其他字段一致为只读（神笔设计器规律）
 
+# 静态样例 catalog 定义于 workflow_catalog.py，此处 re-export 供测试与旧代码引用。
 
 def workflow_registry_slug(workflow_name: str) -> str:
     slug = normalize_workflow_name(workflow_name)
     if not slug:
         slug = hashlib.md5(workflow_name.encode()).hexdigest()[:12]
     return slug
-
-
-def display_workflow_name(name: str) -> str:
-    """办事指南标题 → 应用/流程显示名（去表、去状态后缀）。"""
-    text = (name or "").strip()
-    for suffix in ("（已核对）", "（已核准）", "(已核对)", "(已核准)", "（暂停）", "(暂停)"):
-        text = text.replace(suffix, "")
-    for tail in ("备案表", "申请表", "审批表", "登记表", "报销单", "支付单", "借款单"):
-        if text.endswith(tail):
-            text = text[: -len(tail)]
-            break
-    if text.endswith("表"):
-        text = text[:-1]
-    return text.strip() or name
 
 
 def _registry_ids(registry: dict | None) -> dict[str, str]:
@@ -129,6 +124,12 @@ BUSINESS_LABEL_PROP_MAP: dict[str, str] = {
     "采购合同号": "cghtbh",
     "采购数量": "cgsl",
     "采购发票日期": "cgfprq",
+    "费用事由": "fysy",
+    "报销金额": "bxje",
+    "是否总裁办": "sfzcb",
+    "金额分段": "jefd",
+    "是否审计部": "sfsjb",
+    "出纳类型": "cnlx",
     "其他要求": "qtyq",
 }
 
@@ -212,6 +213,145 @@ def _normalize_form_permissions(model: dict) -> dict:
     return updated
 
 
+def _build_flow_user_choose_column(*, label: str, prop: str) -> dict:
+    """发起人自选：表单信息分组中的选人字段（与神笔样车合同备案表一致）。"""
+    return {
+        "shieldProcessRecord": True,
+        "isImport": True,
+        "idListName": "",
+        "display": True,
+        "dataType": "text",
+        "rules": [],
+        "label": label,
+        "type": "flowUserChoose",
+        "orgCodeList": [],
+        "component": "flow-user-choose",
+        "maxRows": 1,
+        "indb": True,
+        "orgOrRoleSort": "1",
+        "prop": prop,
+        "disabled": False,
+        "nameListName": "",
+        "roleCodeList": [],
+        "selectType": 3,
+        "placeholder": "请选择用户",
+        "endPlaceholder": "",
+        "isSelfTenant": False,
+        "span": 12,
+        "selfOrg": False,
+    }
+
+
+def _resolve_self_select_specs(
+    specs: list[SelfSelectFieldSpec],
+    form_info_cols: list[dict],
+    *,
+    used_props: set[str],
+) -> list[SelfSelectFieldSpec]:
+    """为自选规格补全 prop，并复用表单中已有同标签选人字段。"""
+    label_to_col = {str(c.get("label") or ""): c for c in form_info_cols}
+    resolved: list[SelfSelectFieldSpec] = []
+    for spec in specs:
+        existing = label_to_col.get(spec.field_label)
+        if existing and str(existing.get("type") or "") == "flowUserChoose":
+            prop = str(existing.get("prop") or spec.field_prop)
+            if not is_valid_ascii_prop(prop):
+                prop = label_to_prop(spec.field_label, used_props)
+        elif spec.field_prop and is_valid_ascii_prop(spec.field_prop):
+            prop = spec.field_prop
+        else:
+            prop = label_to_prop(spec.field_label, used_props)
+        resolved.append(
+            SelfSelectFieldSpec(
+                field_label=spec.field_label,
+                field_prop=prop,
+                task_name=spec.task_name,
+            )
+        )
+    return resolved
+
+
+def _balance_half_row_spans(cols: list[dict]) -> None:
+    """span=12 的字段为奇数个时，最后一个改为 span=24，避免半行留白导致错位。"""
+    half_row = [c for c in cols if int(c.get("span") or 12) <= 12]
+    if len(half_row) % 2 == 1 and half_row:
+        half_row[-1]["span"] = 24
+
+
+def _normalize_form_info_layout(form_info_cols: list[dict]) -> None:
+    """表单信息分组：常规字段在前，flowUserChoose 选人字段统一排在末尾并平衡行宽。"""
+    hidden = [c for c in form_info_cols if c.get("display") is False]
+    visible = [c for c in form_info_cols if c.get("display") is not False]
+    regular = [c for c in visible if str(c.get("type") or "") != "flowUserChoose"]
+    user_choose = [c for c in visible if str(c.get("type") or "") == "flowUserChoose"]
+    _balance_half_row_spans(regular)
+    _balance_half_row_spans(user_choose)
+    form_info_cols[:] = hidden + regular + user_choose
+
+
+def _inject_self_select_form_fields(
+    form_info_cols: list[dict],
+    specs: list[SelfSelectFieldSpec],
+    *,
+    used_props: set[str],
+) -> None:
+    """为每个自选环节在表单信息末尾追加 flowUserChoose 字段（已有则跳过）。"""
+    existing_props = {str(c.get("prop") or "") for c in form_info_cols}
+    existing_labels = {str(c.get("label") or "") for c in form_info_cols}
+    extras: list[dict] = []
+    for spec in specs:
+        if spec.field_label in existing_labels:
+            continue
+        if spec.field_prop in existing_props or spec.field_prop in used_props:
+            continue
+        extras.append(_build_flow_user_choose_column(label=spec.field_label, prop=spec.field_prop))
+        used_props.add(spec.field_prop)
+        existing_props.add(spec.field_prop)
+        existing_labels.add(spec.field_label)
+    if extras:
+        form_info_cols.extend(extras)
+
+
+def _ensure_field_contact_person(task_node: dict, *, prop: str, label: str) -> None:
+    if not isinstance(task_node.get("properties"), dict):
+        task_node["properties"] = {}
+    field_contact = json.dumps(
+        {"prop": prop, "label": label, "dataType": "flowUserChoose"},
+        ensure_ascii=False,
+    )
+    task_node["properties"]["personList"] = [
+        {
+            "personType": "fieldContactPerson",
+            "assignMember": None,
+            "fieldContact": field_contact,
+        }
+    ]
+
+
+def _link_self_select_task_persons(task_root: dict | None, specs: list[SelfSelectFieldSpec]) -> None:
+    """自选审批/抄送环节办理人绑定到表单选人字段。"""
+    if not task_root or not specs:
+        return
+    by_task = {s.task_name: s for s in specs}
+    for node in iter_all_tasks(task_root):
+        if node.get("type") not in {"USERTASK", "CCTASK"}:
+            continue
+        spec = by_task.get(str(node.get("taskName") or ""))
+        if spec is None:
+            continue
+        _ensure_field_contact_person(node, prop=spec.field_prop, label=spec.field_label)
+
+
+def _minimal_form_record(template_name: str) -> RawFormRecord:
+    """新增流程：无 OA 原表单，仅保留系统字段 + 流程分支条件字段。"""
+    return RawFormRecord(
+        template_name=template_name,
+        success=True,
+        fields=[],
+        raw={"minimal_form": True},
+    )
+
+
 def _build_form_info_columns(record: RawFormRecord, *, used_props: set[str]) -> list[dict]:
     """表单信息：部门 → 流程编号 → 发起人 → OA 业务字段。"""
     cols = _system_group_columns(used_props=used_props)
@@ -224,13 +364,30 @@ def _build_form_info_columns(record: RawFormRecord, *, used_props: set[str]) -> 
     return cols
 
 
+def _sync_approval_columns(form_model: dict, task_root: dict | None) -> None:
+    """环节 taskKey 规范化后，同步重建审批意见分组字段 prop。"""
+    approval_cols = _build_approval_columns(task_root)
+    for group in form_model.get("group") or []:
+        if group.get("label") == APPROVAL_GROUP_LABEL:
+            group["column"] = approval_cols
+            break
+
+
 def finalize_workflow_model(model: dict, *, start_task_name: str | None = None) -> dict:
     """保存前统一补全环节 key、审批权限与 formModelJson。"""
     updated = copy.deepcopy(model)
     task_root = updated.get("wfSimpleTaskInfo")
     if isinstance(task_root, dict):
         updated["wfSimpleTaskInfo"] = _ensure_task_keys(task_root, start_task_name=start_task_name)
-    # 须先确保 properties 为 dict（复杂流程环节初始 properties=None），再写权限
+    form_model = updated.get("formModel")
+    if isinstance(form_model, dict):
+        _sync_approval_columns(form_model, updated.get("wfSimpleTaskInfo"))
+        for group in form_model.get("group") or []:
+            if group.get("label") == FORM_INFO_GROUP_LABEL:
+                cols = group.get("column")
+                if isinstance(cols, list):
+                    _normalize_form_info_layout(cols)
+                break
     _attach_task_buttons(updated)
     _attach_task_person_lists(updated)
     _attach_form_permissions(updated)
@@ -241,6 +398,10 @@ def finalize_workflow_model(model: dict, *, start_task_name: str | None = None) 
     form_model = updated.get("formModel")
     if isinstance(form_model, dict):
         updated["formModelJson"] = json.dumps(form_model, ensure_ascii=False, separators=(",", ":"))
+    from core.config.shenbi_environments import resolve_shenbi_tenant_id
+    from core.workflow.shenbi_client import normalize_model_tenant_ids
+
+    normalize_model_tenant_ids(updated, resolve_shenbi_tenant_id(get_settings()))
     return updated
 
 
@@ -314,18 +475,22 @@ def _default_task_button_list(task_id: str) -> list[dict]:
     ]
 
 
-# 神笔样例复杂流程默认办理人：管理员角色（P0 平台可跑）
+# 神笔样例复杂流程默认办理人：管理员角色（P0 平台可跑；具体 roleCode 随工作环境切换）
 _DEFAULT_ADMIN_ROLE_ID = "cc2497b91c7dd2f72668cf86447b03e6"
-_DEFAULT_ADMIN_ROLE_INFO = json.dumps(
-    {
-        "id": _DEFAULT_ADMIN_ROLE_ID,
-        "name": "管理员",
-        "relateStartOrgId": False,
-        "roleCode": "admin",
-    },
-    ensure_ascii=False,
-    separators=(",", ":"),
-)
+
+
+def _admin_role_info_json(*, settings: Settings) -> str:
+    cfg = get_shenbi_config(settings)
+    return json.dumps(
+        {
+            "id": cfg.admin_role_id,
+            "name": cfg.admin_role_name,
+            "relateStartOrgId": False,
+            "roleCode": cfg.admin_role_code,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _default_role_person_entry(task_id: str, *, settings: Settings) -> dict:
@@ -336,7 +501,7 @@ def _default_role_person_entry(task_id: str, *, settings: Settings) -> dict:
         "personType": "role",
         "assignMember": None,
         "fieldContact": None,
-        "roleInfo": _DEFAULT_ADMIN_ROLE_INFO,
+        "roleInfo": _admin_role_info_json(settings=settings),
         "creator": "wipadmin",
         "createTime": now,
         "updator": "wipadmin",
@@ -353,7 +518,7 @@ def _has_assignable_person_list(person_list: Any) -> bool:
     if not isinstance(first, dict):
         return False
     person_type = str(first.get("personType") or "").strip()
-    if person_type == "assignMember":
+    if person_type in {"assignMember", "fieldContactPerson"}:
         return True
     return bool(person_type)
 
@@ -373,7 +538,11 @@ def _attach_task_person_lists(model: dict) -> None:
             props = node["properties"]
             existing = props.get("personList")
             if not _has_assignable_person_list(existing):
-                props["personList"] = [_default_role_person_entry(task_id, settings=settings)]
+                task_name = str(node.get("taskName") or "")
+                if task_type == "USERTASK" and "自选" in task_name:
+                    props["personList"] = [{"personType": "assignMember"}]
+                else:
+                    props["personList"] = [_default_role_person_entry(task_id, settings=settings)]
         child = node.get("child")
         if isinstance(child, dict):
             walk(child)
@@ -465,7 +634,7 @@ def _field_permission_entry(field: dict, operating: str, task_id: str | None) ->
     return {
         "id": _new_id(),
         "taskId": task_id if task_id else None,
-        "fieldName": field.get("label") or field.get("prop"),
+        "fieldName": clamp_platform_field_name(field.get("label") or field.get("prop") or ""),
         "fieldProp": field.get("prop"),
         "operating": operating,
         "isField": "true",
@@ -480,11 +649,8 @@ def _field_permission_entry(field: dict, operating: str, task_id: str | None) ->
 
 def _zwjb_operating(task_type: str, task_key: str | None) -> str:
     if task_type == "STARTTASK":
-        return "hide"
-    key = str(task_key or "")
-    if key in _RECRUITMENT_ZWJB_READABLE_KEYS or key.startswith("cs"):
-        return "readable"
-    return "hide"
+        return "writable"
+    return "readable"
 
 
 def _attach_form_permissions(model: dict) -> None:
@@ -495,9 +661,6 @@ def _attach_form_permissions(model: dict) -> None:
         return
 
     form_info, approval = _form_field_index(form_model)
-    hidden_cols = [
-        c for c in _all_form_columns(form_model) if c.get("display") is False and c.get("prop")
-    ]
     visible_form = [c for c in form_info if c.get("display") is not False and c.get("prop")]
 
     def walk(node: dict | None) -> None:
@@ -517,14 +680,12 @@ def _attach_form_permissions(model: dict) -> None:
             props["fromPropertyList"] = None
         else:
             entries: list[dict] = []
-            for col in hidden_cols:
-                entries.append(_field_permission_entry(col, "hide", task_id))
 
             if task_type == "STARTTASK":
                 for col in visible_form:
                     prop = col.get("prop")
                     if prop == "zwjb":
-                        entries.append(_field_permission_entry(col, "hide", task_id))
+                        entries.append(_field_permission_entry(col, "writable", task_id))
                     elif prop in SYSTEM_READONLY_PROPS:
                         entries.append(_field_permission_entry(col, "readable", task_id))
                     else:
@@ -676,6 +837,8 @@ def _allocate_task_key(name: str, used: set[str], *, index: int) -> str:
         base = "todo"
     else:
         base = _task_key_from_name(name, index=index)
+    if not is_valid_ascii_prop(base):
+        base = task_key_from_name(name, index=index)
     key = base
     if key in used:
         suffix = 2
@@ -885,6 +1048,43 @@ def _collect_business_fields(record: RawFormRecord) -> list[dict]:
     return fields
 
 
+def merge_raw_form_records(records: list[RawFormRecord], *, template_name: str) -> RawFormRecord:
+    """合并多个 OA 表单字段（按 label 去重取并集）。"""
+    if not records:
+        raise ValueError("无可合并的表单")
+    if len(records) == 1:
+        return records[0]
+
+    merged_fields: list = []
+    seen: set[str] = set()
+    dom_labels: list[str] = []
+    for record in records:
+        for item in record.fields:
+            label = (item.label or "").strip()
+            if _is_skippable_business_label(label) or not label or label in seen:
+                continue
+            seen.add(label)
+            merged_fields.append(item)
+        raw = record.raw or {}
+        for label in raw.get("domLabels") or raw.get("inputLabels") or []:
+            label = (label or "").strip()
+            if _is_skippable_business_label(label) or not label or label in seen:
+                continue
+            seen.add(label)
+            dom_labels.append(label)
+
+    return RawFormRecord(
+        template_name=template_name,
+        template_id=records[0].template_id,
+        template_url=records[0].template_url,
+        oa_category=records[0].oa_category,
+        success=all(r.success for r in records),
+        fields=merged_fields,
+        raw={"domLabels": dom_labels, "merged_from": [r.template_name for r in records]},
+        extracted_at=records[0].extracted_at,
+    )
+
+
 def _sync_task_tree_proc_ids(task: dict | None, *, proc_id: str, pid: str | None = None) -> dict | None:
     """保留设计器环节 id，同步 procId/pid（含 conditions 分支）。"""
     if not task:
@@ -962,10 +1162,7 @@ def _regenerate_task_tree(task: dict | None, *, proc_id: str, pid: str | None = 
 
 
 def _task_key_from_name(name: str, *, index: int) -> str:
-    ascii_part = re.sub(r"[^\w]", "", name.encode("ascii", "ignore").decode())
-    if ascii_part:
-        return f"{ascii_part[:20].lower()}_{index}"
-    return f"task_{hashlib.md5(name.encode()).hexdigest()[:8]}"
+    return task_key_from_name(name, index=index)
 
 
 def _extract_task_template(template_root: dict | None, task_type: str) -> dict | None:
@@ -1078,8 +1275,11 @@ def _ensure_task_keys(root: dict | None, *, start_task_name: str | None = None) 
 
         key = str(node.get("taskKey") or "").strip()
         if task_type != "ROUTE":
-            if not key:
-                key = _task_key_from_name(node.get("taskName") or task_type or "task", index=usertask_idx)
+            if not key or not is_valid_ascii_prop(key):
+                key = _task_key_from_name(
+                    node.get("taskName") or task_type or "task",
+                    index=max(usertask_idx, 1),
+                )
                 node["taskKey"] = key
             if key in used_keys:
                 suffix = 2
@@ -1108,7 +1308,7 @@ def _build_task_tree(
     proc_id: str,
     settings: Settings,
 ) -> tuple[dict | None, str]:
-    """P2：办事指南 DAG → 环节树（complex_recruitment / linear / 通用 fan-out）。"""
+    """P2：办事指南 DAG → 环节树（招聘并行 / 通用 fan-out / 线性，由拓扑自动选型）。"""
     return compile_task_tree_from_guide(
         workflow_name,
         nodes,
@@ -1133,14 +1333,29 @@ def _build_task_tree_from_guide_nodes(
     )
 
 
+def parsed_flow_matches_catalog(workflow_name: str, flow: WorkflowFlowResult) -> bool:
+    """parse 结果标题须与 catalog 流程名足够接近，避免误匹配其他板块流程。"""
+    hints = get_catalog_hints(workflow_name)
+    candidates = [str(flow.title or ""), str(flow.image.title_hint or "")]
+    for hint in hints:
+        hint_norm = normalize_workflow_name(hint)
+        if not hint_norm:
+            continue
+        for cand in candidates:
+            cand_norm = normalize_workflow_name(cand)
+            if hint_norm == cand_norm:
+                return True
+            if string_similarity(hint, cand) >= 0.92:
+                return True
+    return False
+
+
 def find_parsed_flow(workflow_name: str, *, settings: Settings | None = None) -> WorkflowFlowResult | None:
     settings = settings or get_settings()
     result = load_result(settings)
     if not result:
         return None
-    meta = WORKFLOW_CATALOG.get(workflow_name, {})
-    hints = list(meta.get("guide_flow_hints") or [])
-    hints.append(workflow_name)
+    hints = get_catalog_hints(workflow_name)
     best: WorkflowFlowResult | None = None
     best_score = 0.0
     best_nodes = -1
@@ -1164,7 +1379,7 @@ def find_parsed_flow(workflow_name: str, *, settings: Settings | None = None) ->
                         best_score = score
                         best_nodes = len(flow.nodes)
                         best = flow
-    if best_score >= 0.82:
+    if best_score >= 0.82 and best is not None and parsed_flow_matches_catalog(workflow_name, best):
         return best
     return None
 
@@ -1177,24 +1392,18 @@ def _customize_model(
     shared: dict,
     parsed_flow: WorkflowFlowResult,
     registry: dict | None = None,
+    app_display_name: str | None = None,
+    form_display_name: str | None = None,
 ) -> dict:
-    display_name = display_workflow_name(workflow_name)
+    display_name = app_display_name or display_app_name(workflow_name)
+    form_name = form_display_name or display_form_name(workflow_name)
     reg = _registry_ids(registry)
-    flow_kind = (WORKFLOW_CATALOG.get(workflow_name) or {}).get("flow_kind")
-
-    if flow_kind == "complex_recruitment":
-        # 复杂流程 ID 由 save 层按设计器当前 proc 决定；生成 JSON 时不绑定 registry
-        form_id = None
-        proc_id = None
-        proc_key = None
-        table_name = None
-        app_id = reg.get("app_id") or None
-    else:
-        form_id = reg.get("form_id") or shared.setdefault("form_id", _new_id())
-        proc_id = reg.get("proc_id") or shared.setdefault("proc_id", _new_id())
-        proc_key = reg.get("proc_key") or None
-        table_name = reg.get("table_name") or proc_key
-        app_id = reg.get("app_id") or None
+    # 统一写入路径：form/proc 由 save 层 create；生成 JSON 时仅复用 appId
+    form_id = None
+    proc_id = None
+    proc_key = None
+    table_name = None
+    app_id = reg.get("app_id") or None
 
     if not parsed_flow.nodes:
         raise ValueError(
@@ -1212,24 +1421,16 @@ def _customize_model(
     if not task_root:
         raise ValueError(f"无法从办事指南节点生成流程环节：{workflow_name}")
     shared["task_tree_source"] = task_tree_source
-    if (WORKFLOW_CATALOG.get(workflow_name) or {}).get("flow_kind") == "complex_recruitment":
+    if is_recruitment_task_tree_source(task_tree_source):
         bindings = summarize_recruitment_branch_plans(parsed_flow.nodes)
         shared["dept_branch_bindings"] = bindings
-        for item in bindings:
-            if item.get("dept_label") == "总裁办":
-                contents = item.get("guide_contents") or []
-                if any("副主任" in str(c) for c in contents):
-                    shared["parse_warnings"] = [
-                        "总裁办并行分支 parse 仍为「副主任」（seq "
-                        f"{(item.get('guide_seqs') or ['?'])[0]}）。"
-                        "若 Word 图为「总裁办主任」，请在「流程解析」→ 调试覆盖中修改 seq 5 并保存，"
-                        "或重新解析该流程图。"
-                    ]
-                break
+    if is_expense_task_tree_source(task_tree_source):
+        shared["expense_branch_bindings"] = summarize_expense_branch_bindings(parsed_flow.nodes)
 
     used_props: set[str] = set()
     form_info_cols = _build_form_info_columns(record, used_props=used_props)
-    if (WORKFLOW_CATALOG.get(workflow_name) or {}).get("flow_kind") == "complex_recruitment":
+    existing_labels = {str(c.get("label") or "") for c in form_info_cols}
+    if is_recruitment_task_tree_source(task_tree_source):
         branch_props = {c["prop"] for c in recruitment_branch_form_fields()}
         insert_at = len(form_info_cols)
         for idx, col in enumerate(form_info_cols):
@@ -1243,6 +1444,85 @@ def _customize_model(
                 extras.append(col)
         form_info_cols[insert_at:insert_at] = extras
         used_props.update(branch_props)
+    elif is_expense_task_tree_source(task_tree_source):
+        insert_at = len(form_info_cols)
+        for idx, col in enumerate(form_info_cols):
+            if col.get("prop") == "fqr":
+                insert_at = idx + 1
+                break
+        extras = []
+        branch_cols = (
+            foreign_trade_expense_branch_form_fields(existing_labels=existing_labels)
+            if task_tree_source == "guide_dag_compiler:foreign_trade_expense"
+            else expense_branch_form_fields(existing_labels=existing_labels)
+        )
+        for col in branch_cols:
+            if col["prop"] not in used_props:
+                used_props.add(col["prop"])
+                extras.append(col)
+        if task_tree_source == "guide_dag_compiler:foreign_trade_expense":
+            ensure_fybm_select_field(form_info_cols, used_props=used_props)
+        form_info_cols[insert_at:insert_at] = extras
+    elif JEFD_FIELD in branch_field_props_in_tree(task_root):
+        insert_at = len(form_info_cols)
+        for idx, col in enumerate(form_info_cols):
+            if col.get("prop") == "fqr":
+                insert_at = idx + 1
+                break
+        extras = []
+        for col in amount_branch_form_fields(existing_labels=existing_labels):
+            if col["prop"] not in used_props:
+                used_props.add(col["prop"])
+                extras.append(col)
+        form_info_cols[insert_at:insert_at] = extras
+    elif FYLX_FIELD in branch_field_props_in_tree(task_root):
+        insert_at = len(form_info_cols)
+        for idx, col in enumerate(form_info_cols):
+            if col.get("prop") == "fqr":
+                insert_at = idx + 1
+                break
+        extras = []
+        for col in expense_type_branch_form_fields(existing_labels=existing_labels):
+            if col["prop"] not in used_props:
+                used_props.add(col["prop"])
+                extras.append(col)
+        form_info_cols[insert_at:insert_at] = extras
+    elif ZGS_FIELD in branch_field_props_in_tree(task_root) or SLYZ_FIELD in branch_field_props_in_tree(
+        task_root
+    ):
+        insert_at = len(form_info_cols)
+        for idx, col in enumerate(form_info_cols):
+            if col.get("prop") == "fqr":
+                insert_at = idx + 1
+                break
+        extras = []
+        for col in subsidiary_branch_form_fields(existing_labels=existing_labels):
+            if col["prop"] not in used_props:
+                used_props.add(col["prop"])
+                extras.append(col)
+        form_info_cols[insert_at:insert_at] = extras
+    raw_self_select = collect_self_select_field_specs(parsed_flow.nodes)
+    raw_self_select += collect_self_select_cc_specs(parsed_flow.nodes)
+    seen_task_names: set[str] = set()
+    merged_self_select: list[SelfSelectFieldSpec] = []
+    for spec in raw_self_select:
+        if spec.task_name in seen_task_names:
+            continue
+        seen_task_names.add(spec.task_name)
+        merged_self_select.append(spec)
+    self_select_specs = _resolve_self_select_specs(
+        merged_self_select,
+        form_info_cols,
+        used_props=used_props,
+    )
+    _inject_self_select_form_fields(form_info_cols, self_select_specs, used_props=used_props)
+    _normalize_form_info_layout(form_info_cols)
+    task_root = _ensure_task_keys(task_root, start_task_name=(
+        "申请填报"
+        if is_recruitment_task_tree_source(task_tree_source)
+        or is_expense_task_tree_source(task_tree_source)
+        else (start_steps[0].task_name if start_steps else None)
+    ))
     approval_cols = _build_approval_columns(task_root)
 
     model = {
@@ -1252,7 +1532,7 @@ def _customize_model(
             form_info_cols=form_info_cols,
             approval_cols=approval_cols,
             form_id=form_id,
-            workflow_name=display_name,
+            workflow_name=form_name,
             table_name=table_name,
         ),
         "wfSimpleProc": _build_wf_simple_proc(
@@ -1266,13 +1546,15 @@ def _customize_model(
         ),
         "wfSimpleTaskInfo": task_root,
     }
+    _link_self_select_task_persons(task_root, self_select_specs)
     shared["semantic_flow_chain"] = semantic_steps_summary(semantic_steps)
 
     return finalize_workflow_model(
         model,
         start_task_name=(
             "申请填报"
-            if (WORKFLOW_CATALOG.get(workflow_name) or {}).get("flow_kind") == "complex_recruitment"
+            if is_recruitment_task_tree_source(task_tree_source)
+            or is_expense_task_tree_source(task_tree_source)
             else (start_steps[0].task_name if start_steps else None)
         ),
     )
@@ -1286,8 +1568,7 @@ def build_workflow_payloads(
 ) -> dict[str, Any]:
     """程序化生成完整 model-save 请求体（不读取 data 样例 JSON）。"""
     settings = settings or get_settings()
-    if workflow_name not in WORKFLOW_CATALOG:
-        raise ValueError(f"未知工作流：{workflow_name}")
+    meta = get_catalog_meta(workflow_name, settings=settings)
 
     from core.workflow.shenbi_client import load_workflow_registry, registry_app_verified
 
@@ -1296,17 +1577,11 @@ def build_workflow_payloads(
     if registry is not None and not registry_app_verified(registry):
         registry = None
 
-    meta = WORKFLOW_CATALOG[workflow_name]
-    record = load_form(meta["form_slug"], settings)
+    record = load_form(str(meta["form_slug"]), settings)
     if not record or not record.success:
         raise FileNotFoundError(f"未找到已成功提取的 OA 表单：{meta['form_slug']}")
 
-    ensure_guide_parse_fresh(settings)
-    parsed_flow = find_parsed_flow(workflow_name, settings=settings)
-    if not parsed_flow or not parsed_flow.nodes:
-        raise ValueError(
-            f"未找到「{workflow_name}」的办事指南流程解析结果，请先在「流程解析」页完成解析并保存"
-        )
+    parsed_flow = resolve_parsed_flow(workflow_name, settings=settings)
     business_fields = _collect_business_fields(record)
     if not business_fields:
         raise ValueError(f"OA 表单 {meta['form_slug']} 无可用业务字段，无法生成神笔表单")
@@ -1330,6 +1605,7 @@ def build_workflow_payloads(
         "parsed_node_count": len(parsed_flow.nodes) if parsed_flow else 0,
         "task_tree_source": shared.get("task_tree_source") or "",
         "dept_branch_bindings": shared.get("dept_branch_bindings") or [],
+        "expense_branch_bindings": shared.get("expense_branch_bindings") or [],
         "parse_warnings": shared.get("parse_warnings") or [],
         "semantic_flow_chain": shared.get("semantic_flow_chain") or [],
         "model": model,
@@ -1344,3 +1620,90 @@ def save_generated_payloads(payloads: dict[str, Any], *, settings: Settings | No
     path = out_dir / f"{slug}_payloads.json"
     path.write_text(json.dumps(payloads, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def build_template_workflow_payloads(
+    target,
+    *,
+    settings: Settings | None = None,
+    parsed_flow: WorkflowFlowResult | None = None,
+) -> dict[str, Any]:
+    """基于模板表匹配目标生成 model-save JSON（AI_ 应用名，不复用旧 registry）。"""
+    from core.workflow.result_store import resolve_parsed_flow
+    from core.workflow.shenbi_client import load_workflow_registry, registry_app_verified
+    from core.workflow.template_matcher import (
+        ai_app_display_name,
+        find_parsed_flow_by_guide,
+        load_template_form_record,
+        template_registry_name,
+    )
+
+    settings = settings or get_settings()
+    if not target.is_new_form and not target.form_slug and not target.form_slugs:
+        raise ValueError(target.skip_reason or f"流程「{target.guide_title}」缺少 OA 表单")
+
+    if target.is_new_form or not target.form_slugs:
+        record = _minimal_form_record(target.guide_title)
+    elif target.form_slugs:
+        records = []
+        for slug in target.form_slugs:
+            rec = load_template_form_record(slug, settings=settings)
+            if rec:
+                records.append(rec)
+        if not records:
+            raise FileNotFoundError(f"未找到已成功提取的 OA 表单：{target.form_slugs}")
+        record = merge_raw_form_records(records, template_name=target.form_slug or target.guide_title)
+    else:
+        record = load_template_form_record(target.form_slug, settings=settings)
+        if not record:
+            raise FileNotFoundError(f"未找到已成功提取的 OA 表单：{target.form_slug}")
+
+    flow = parsed_flow or find_parsed_flow_by_guide(
+        target.guide_title,
+        sector_index=target.guide_sector_index,
+        settings=settings,
+    )
+    if not flow or not flow.nodes:
+        flow = resolve_parsed_flow(target.workflow_key, settings=settings)
+
+    registry_key = template_registry_name(target.target_key)
+    registry = load_workflow_registry(registry_key, settings=settings)
+    if registry is not None and not registry_app_verified(registry):
+        registry = None
+
+    business_fields = _collect_business_fields(record)
+    if not target.is_new_form and not business_fields:
+        raise ValueError(f"OA 表单 {target.form_slug} 无可用业务字段，无法生成神笔表单")
+
+    shared: dict[str, str] = {}
+    model = _customize_model(
+        workflow_name=target.workflow_key,
+        record=record,
+        settings=settings,
+        shared=shared,
+        parsed_flow=flow,
+        registry=registry,
+        app_display_name=target.app_display_name or ai_app_display_name(target.guide_title),
+        form_display_name=display_form_name(target.guide_title),
+    )
+
+    return {
+        "workflow_name": registry_key,
+        "template_target_key": target.target_key,
+        "generated_at": _now_str(),
+        "source_form": record.template_name,
+        "source_forms": list(target.form_slugs) if target.form_slugs else ([record.template_name] if not target.is_new_form else []),
+        "field_count": len(business_fields),
+        "is_new_form": target.is_new_form,
+        "parsed_flow_title": (flow.title or flow.image.title_hint) if flow else "",
+        "parsed_node_count": len(flow.nodes) if flow else 0,
+        "task_tree_source": shared.get("task_tree_source") or "",
+        "dept_branch_bindings": shared.get("dept_branch_bindings") or [],
+        "expense_branch_bindings": shared.get("expense_branch_bindings") or [],
+        "parse_warnings": shared.get("parse_warnings") or [],
+        "semantic_flow_chain": shared.get("semantic_flow_chain") or [],
+        "model": model,
+        "is_update": bool(registry),
+        "template_mode": True,
+        "app_display_name": target.app_display_name,
+    }

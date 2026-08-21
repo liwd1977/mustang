@@ -41,7 +41,10 @@ def test_recruitment_task_tree_topology():
 
 
 def test_recruitment_payload_has_branch_fields():
-    assert WORKFLOW_CATALOG["野马集团二线招聘需求表"]["flow_kind"] == "complex_recruitment"
+    from core.config.settings import get_settings
+    from core.config.shenbi_environments import get_shenbi_config
+
+    expected_role = get_shenbi_config(get_settings()).admin_role_code
     payloads = build_workflow_payloads("野马集团二线招聘需求表")
     form_model = payloads["model"]["formModel"]
     form_group = next(g for g in form_model["group"] if g["label"] == "表单信息")
@@ -63,4 +66,4 @@ def test_recruitment_payload_has_branch_fields():
         person_list = (task.get("properties") or {}).get("personList") or []
         assert person_list, f"{task.get('taskName')} 缺少 personList"
         assert person_list[0].get("personType") == "role"
-        assert "admin" in (person_list[0].get("roleInfo") or "")
+        assert expected_role in (person_list[0].get("roleInfo") or "")

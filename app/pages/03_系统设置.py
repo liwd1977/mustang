@@ -11,12 +11,14 @@ if str(ROOT) not in sys.path:
 
 import streamlit as st
 
-from core.config.settings import get_settings
+from core.config.settings import get_settings, reload_settings
+from core.config.shenbi_environments import SHENBI_ENVIRONMENT_OPTIONS, get_shenbi_config
 
 st.set_page_config(page_title="系统设置", layout="wide")
 st.title("系统设置")
 
-settings = get_settings()
+settings = reload_settings()
+shenbi_cfg = get_shenbi_config(settings)
 
 st.subheader("路径与文档")
 st.markdown(
@@ -34,12 +36,25 @@ st.markdown(
     f"""
 - **GUIDE_PARSE_USE_CACHE**：`{settings.guide_parse_use_cache}` — {_cache_mode}
 - **VLM_FLOW_LIMIT**：`{settings.vlm_flow_limit}`（0 = 不限制）
+- **WORKFLOW_PER_SECTOR_LIMIT**：`{settings.workflow_per_sector_limit}`（0 = 每板块不限制）
+- **办事指南**：`{settings.guide_docx_name}`
 """
 )
 st.caption(
     "开发阶段保持 GUIDE_PARSE_USE_CACHE=false，写入/生成 payload 时会读取办事指南最新 Word 并自动解析。"
     "批量处理时可设为 true 提速；文档更新后请在「流程解析」页手动重新解析。"
 )
+
+st.subheader("神笔工作环境")
+st.markdown(
+    f"""
+- **当前环境**：{shenbi_cfg.label}（`{shenbi_cfg.environment}`）
+- **API 地址**：`{shenbi_cfg.base_url}`
+- **写入角色**：{shenbi_cfg.admin_role_name}（`{shenbi_cfg.admin_role_code}`）
+- 可选环境：{", ".join(f"{k}={v}" for k, v in SHENBI_ENVIRONMENT_OPTIONS.items())}
+"""
+)
+st.caption("在「流程写入」页侧边栏切换环境，或在对话中说「切换到开发环境 / 野马数智化平台」。")
 
 st.subheader("环境配置")
 st.table(
@@ -53,6 +68,7 @@ st.table(
             "DATA_DIR",
             "OUTPUT_DIR",
             "GUIDE_PARSE_USE_CACHE",
+            "SHENBI_ENVIRONMENT",
             "SHENBI_BASE_URL",
             "SHENBI_API_TOKEN",
         ],
@@ -65,8 +81,9 @@ st.table(
             str(settings.data_dir),
             str(settings.output_dir),
             str(settings.guide_parse_use_cache),
-            settings.shenbi_base_url,
-            "已配置" if settings.shenbi_api_token else "未配置",
+            shenbi_cfg.label,
+            shenbi_cfg.base_url,
+            "已配置" if shenbi_cfg.api_token else "未配置",
         ],
     }
 )

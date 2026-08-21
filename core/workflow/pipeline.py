@@ -6,11 +6,12 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from core.config.settings import get_settings, reload_settings
+from core.config.settings import Settings, get_settings, reload_settings
 from core.form.name_utils import normalize_workflow_name
 from core.llm.qwen_client import QwenClient
 from core.logging.delivery_logger import DeliveryRunLogger, setup_delivery_logger
-from core.workflow.flow_filter import dedupe_sector_flows, format_flow_display_title
+from core.workflow.flow_filter import dedupe_sector_flows, format_flow_display_title, is_image_within_sector_flow_limit
+from core.workflow.parse_quality import validate_flow_parse
 from core.workflow.result_store import load_result, save_result
 from core.workflow.vlm_recognizer import (
     placeholder_flow,
@@ -18,11 +19,12 @@ from core.workflow.vlm_recognizer import (
     skipped_flow,
 )
 from core.workflow.word_parser import parse_guide_docx, parse_guide_docx_from_bytes
-from schemas.workflow import GuideParseResult, SectorWorkflowResult, WorkflowFlowResult, WorkflowImage
+from schemas.workflow import GuideParseResult, SectorBlock, SectorWorkflowResult, WorkflowFlowResult, WorkflowImage
 
 ProgressCallback = Callable[[int, int, str], None]
 
 SHIELDED_FLOW_MSG = "暂仅解析首个流程（调试模式，其余 VLM 已屏蔽）"
+SECTOR_LIMIT_MSG = "试点阶段：板块仅解析前 {n} 个流程（样例流程除外）"
 
 
 def _count_flowcharts(sectors) -> tuple[int, int, int]:
@@ -82,6 +84,9 @@ def _reuse_cached_flow(
         elif old_path and not Path(old_path).is_file() and not (image.path and Path(image.path).is_file()):
             continue
         title = format_flow_display_title(image.index, image.title_hint or flow.image.title_hint)
+        ok, _ = validate_flow_parse(image.title_hint or flow.image.title_hint or "", flow.nodes)
+        if not ok:
+            continue
         return flow.model_copy(update={"image": image, "title": title})
     return None
 
@@ -96,10 +101,16 @@ def run_guide_pipeline(
     section_to: int = 10,
     on_progress: ProgressCallback | None = None,
     vlm_flow_limit: int | None = None,
+    per_sector_flow_limit: int | None = None,
+    settings: Settings | None = None,
 ) -> GuideParseResult:
-    reload_settings()
-    settings = get_settings()
+    if settings is None:
+        reload_settings()
+        settings = get_settings()
     flow_limit = settings.vlm_flow_limit if vlm_flow_limit is None else vlm_flow_limit
+    sector_limit = (
+        settings.workflow_per_sector_limit if per_sector_flow_limit is None else per_sector_flow_limit
+    )
     output_root = settings.output_dir / "workflows"
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -177,6 +188,8 @@ def run_guide_pipeline(
     sector_results: list[SectorWorkflowResult] = []
     cached_flows = _load_cached_flow_map(settings) if (recognize and settings.guide_parse_use_cache) else {}
 
+    from core.workflow.workflow_catalog import static_sample_key_for_title
+
     def _flush_progress(*, in_progress: SectorWorkflowResult | None = None) -> None:
         """增量写入磁盘，刷新页面时可看到最新进度。"""
         partial = list(sector_results)
@@ -213,6 +226,17 @@ def run_guide_pipeline(
                 )
                 flows.append(skipped_flow(image))
                 continue
+
+            if sector_limit > 0 and static_sample_key_for_title(image.title_hint or "") is None:
+                if not is_image_within_sector_flow_limit(sector, image, sector_limit):
+                    limit_msg = SECTOR_LIMIT_MSG.format(n=sector_limit)
+                    run_log.flow_skipped(
+                        sector_index=sector.index,
+                        flow_title=flow_title,
+                        reason=limit_msg,
+                    )
+                    flows.append(placeholder_flow(image, error=limit_msg))
+                    continue
 
             fallback = f"{sector.title} - {image.filename}" if sector.title else image.filename
             cached_flow = _reuse_cached_flow(
@@ -290,6 +314,103 @@ def run_guide_pipeline(
         vlm_flow_limit=flow_limit,
     )
     return result
+
+
+def _catalog_flow_hints(workflow_name: str) -> list[str]:
+    from core.workflow.workflow_catalog import get_catalog_hints
+
+    return get_catalog_hints(workflow_name)
+
+
+def find_catalog_flow_image(
+    workflow_name: str,
+    sectors: list[SectorBlock],
+    *,
+    min_score: float = 0.82,
+) -> tuple[SectorBlock, WorkflowImage] | None:
+    """在 Word 提取结果中定位 catalog 流程图。"""
+    from core.form.name_utils import string_similarity
+
+    hints = _catalog_flow_hints(workflow_name)
+    best_sector: SectorBlock | None = None
+    best_image: WorkflowImage | None = None
+    best_score = 0.0
+    for sector in sectors:
+        for image in sector.images:
+            if image.skipped:
+                continue
+            for hint in hints:
+                score = string_similarity(hint, image.title_hint or "")
+                if score > best_score:
+                    best_score = score
+                    best_sector = sector
+                    best_image = image
+    if best_score >= min_score and best_sector is not None and best_image is not None:
+        return best_sector, best_image
+    return None
+
+
+def recognize_catalog_workflow(
+    workflow_name: str,
+    *,
+    settings: Settings | None = None,
+) -> WorkflowFlowResult:
+    """开发模式：仅 VLM 识别 catalog 指定流程图，并增量写入 parse 缓存。"""
+    from core.config.settings import get_settings
+    from core.llm.qwen_client import QwenClient
+    from core.workflow.result_store import is_result_stale, load_result, upsert_flow_in_result
+    from core.workflow.vlm_recognizer import recognize_workflow_flow
+    from schemas.workflow import GuideParseResult
+
+    settings = settings or get_settings()
+    output_root = settings.output_dir / "workflows"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    result = load_result(settings)
+    stale = result is None or is_result_stale(result, settings)
+    if stale or not result.sectors:
+        word_result = parse_guide_docx(
+            settings.guide_docx_path,
+            output_dir=output_root,
+            output_stem=settings.guide_output_stem,
+            section_from=2,
+            section_to=10,
+        )
+        if result is None:
+            result = GuideParseResult(
+                source_file=str(settings.guide_docx_path),
+                output_dir=str(output_root / settings.guide_output_stem),
+                sectors=word_result.sectors,
+                errors=list(word_result.errors),
+                total_flowcharts=word_result.total_flowcharts,
+                skipped_flowcharts=word_result.skipped_flowcharts,
+            )
+        else:
+            result.sectors = word_result.sectors
+            result.output_dir = word_result.output_dir
+            result.errors = list(word_result.errors)
+            result.total_flowcharts = word_result.total_flowcharts
+            result.skipped_flowcharts = word_result.skipped_flowcharts
+
+    match = find_catalog_flow_image(workflow_name, result.sectors)
+    if match is None:
+        raise ValueError(f"办事指南 Word 中未找到与「{workflow_name}」匹配的流程图")
+
+    sector, image = match
+    client = QwenClient()
+    if not client.available:
+        raise ValueError("未配置 QWEN_API_KEY / OPENAI_API_KEY，无法 VLM 识别流程图")
+
+    context = f"板块{sector.index} {sector.title}\n{sector.text_content[:500]}"
+    fallback = f"{sector.title} - {image.filename}" if sector.title else image.filename
+    flow = recognize_workflow_flow(
+        image,
+        client=client,
+        context_text=context,
+        fallback_title=fallback,
+    )
+    upsert_flow_in_result(result, sector.index, flow, settings=settings)
+    return flow
 
 
 def load_stored_result() -> GuideParseResult | None:

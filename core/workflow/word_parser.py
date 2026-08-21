@@ -45,6 +45,7 @@ SECTION_HEADING_RE = re.compile(
 BLIP_XPATH = ".//*[local-name()='blip']"
 REL_EMBED = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
 HEADING_STYLE_PREFIX = "Heading 1"
+STACKED_IMAGE_MIN_HEIGHT = 1800
 
 
 def parse_section_number(text: str) -> tuple[int, str] | None:
@@ -116,6 +117,32 @@ def _guess_extension(blob: bytes) -> str:
     return ".png"
 
 
+def _split_image_blob(blob: bytes, parts: int) -> list[bytes]:
+    """将纵向堆叠的多张流程图切分为独立图片。"""
+    if parts <= 1:
+        return [blob]
+    with Image.open(io.BytesIO(blob)) as img:
+        width, height = img.size
+        part_h = max(1, height // parts)
+        out: list[bytes] = []
+        for i in range(parts):
+            top = i * part_h
+            bottom = height if i == parts - 1 else (i + 1) * part_h
+            crop = img.crop((0, top, width, bottom))
+            buf = io.BytesIO()
+            crop.save(buf, format=img.format or "PNG")
+            out.append(buf.getvalue())
+        return out
+
+
+def _image_height(blob: bytes) -> int:
+    try:
+        with Image.open(io.BytesIO(blob)) as img:
+            return img.size[1]
+    except Exception:
+        return 0
+
+
 def _save_image(blob: bytes, dest_dir: Path, index: int, *, title_hint: str = "") -> WorkflowImage:
     dest_dir.mkdir(parents=True, exist_ok=True)
     ext = _guess_extension(blob)
@@ -145,6 +172,7 @@ def _append_flow_image(
     doc: DocxDocument,
     blob: bytes | None,
     title_hint: str,
+    pending_titles: list[str],
 ) -> None:
     if should_skip_flow_title(title_hint):
         sector.images.append(
@@ -158,6 +186,22 @@ def _append_flow_image(
         return
     if blob is None:
         return
+
+    waiting = [t for t in pending_titles if t != title_hint]
+    assign_titles = waiting + [title_hint]
+    height = _image_height(blob)
+    if height >= STACKED_IMAGE_MIN_HEIGHT and len(assign_titles) >= 2:
+        for part_blob, hint in zip(_split_image_blob(blob, len(assign_titles)), assign_titles, strict=False):
+            img = _save_image(
+                part_blob,
+                sector_dir / f"sector_{sector.index:02d}",
+                len(sector.images) + 1,
+                title_hint=hint,
+            )
+            sector.images.append(img)
+        pending_titles.clear()
+        return
+
     img = _save_image(
         blob,
         sector_dir / f"sector_{sector.index:02d}",
@@ -165,6 +209,9 @@ def _append_flow_image(
         title_hint=title_hint,
     )
     sector.images.append(img)
+    for title in assign_titles:
+        while title in pending_titles:
+            pending_titles.remove(title)
 
 
 def parse_guide_docx(
@@ -188,6 +235,7 @@ def parse_guide_docx(
     sector_dir.mkdir(parents=True, exist_ok=True)
 
     sectors: dict[int, SectorBlock] = {}
+    pending_titles_by_sector: dict[int, list[str]] = {}
     current_index: int | None = None
     current_title = ""
     text_lines: list[str] = []
@@ -230,6 +278,8 @@ def parse_guide_docx(
             current_flow_title = t
             current_flow_skipped = should_skip_flow_title(t)
             line_before_metadata = ""
+            if current_index is not None and not current_flow_skipped:
+                pending_titles_by_sector.setdefault(current_index, []).append(t)
             return
 
         line_before_metadata = t
@@ -272,6 +322,7 @@ def parse_guide_docx(
                                         doc=doc,
                                         blob=blob,
                                         title_hint=hint,
+                                        pending_titles=pending_titles_by_sector.setdefault(current_index, []),
                                     )
             continue
 
@@ -327,6 +378,7 @@ def parse_guide_docx(
                         doc=doc,
                         blob=blob,
                         title_hint=hint,
+                        pending_titles=pending_titles_by_sector.setdefault(current_index, []),
                     )
 
     flush_sector()

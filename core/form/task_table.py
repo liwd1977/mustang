@@ -1,4 +1,4 @@
-"""读取流程任务表 Excel（遍历全部 Sheet，B/C/D 列）。"""
+"""读取流程任务表 Excel（遍历全部 Sheet，B/C/D/F 列）。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from core.form.template_table import TemplateTableRow
 from schemas.form import TaskTableRow
 
 HEADER_MARKERS = ("原系统表单名称", "后端拉取流程", "现场拉取流程")
 SHEET_SUFFIX_RE = re.compile(r"[（(][^）)]*[）)]")
+PENDING_WRITE_START_ROW = 3  # Excel 行号（含表头后首条数据）
+COMPLETED_WRITE_STATUSES = frozenset({"已完成", "进行中"})
 
 
 def _clean(value: object) -> str:
@@ -33,16 +36,24 @@ def _is_sector_row(b: str, c: str, d: str) -> bool:
     return not b and bool(c) and not d
 
 
-def _parse_sheet_df(df: pd.DataFrame, *, sheet_name: str) -> list[TaskTableRow]:
+def _parse_sheet_df(
+    df: pd.DataFrame,
+    *,
+    sheet_name: str,
+    start_row: int = 1,
+    include_completion_status: bool = False,
+) -> list[TaskTableRow]:
     rows: list[TaskTableRow] = []
     current_sector = _normalize_sector(sheet_name)
+    start_idx = max(start_row - 1, 0)
 
-    for idx in range(len(df)):
+    for idx in range(start_idx, len(df)):
         seq = _clean(df.iloc[idx, 0])
         form_name = _clean(df.iloc[idx, 1])
         backend_flow = _clean(df.iloc[idx, 2])
         field_flow = _clean(df.iloc[idx, 3]) if df.shape[1] > 3 else ""
         remark = _clean(df.iloc[idx, 4]) if df.shape[1] > 4 else ""
+        completion_status = _clean(df.iloc[idx, 5]) if include_completion_status and df.shape[1] > 5 else ""
 
         if _is_header_row(form_name, backend_flow, field_flow):
             continue
@@ -68,6 +79,7 @@ def _parse_sheet_df(df: pd.DataFrame, *, sheet_name: str) -> list[TaskTableRow]:
                 backend_flow=backend_flow,
                 field_flow=field_flow,
                 remark=remark,
+                completion_status=completion_status,
             )
         )
     return rows
@@ -86,6 +98,56 @@ def load_task_table(path: Path) -> list[TaskTableRow]:
                 continue
             rows.extend(_parse_sheet_df(df, sheet_name=sheet_name))
     return rows
+
+
+def load_pending_write_rows(path: Path, *, start_row: int = PENDING_WRITE_START_ROW) -> list[TaskTableRow]:
+    """读取待写入流程清单：第 3 行起，C 列有值且 F 列非「已完成/进行中」。"""
+    if not path.is_file():
+        raise FileNotFoundError(f"任务表不存在: {path}")
+
+    rows: list[TaskTableRow] = []
+    with pd.ExcelFile(path) as workbook:
+        for sheet_name in workbook.sheet_names:
+            df = pd.read_excel(workbook, sheet_name=sheet_name, header=None)
+            if df.empty:
+                continue
+            sheet_rows = _parse_sheet_df(
+                df,
+                sheet_name=sheet_name,
+                start_row=start_row,
+                include_completion_status=True,
+            )
+            for row in sheet_rows:
+                if not row.backend_flow.strip():
+                    continue
+                status = row.completion_status.strip()
+                if status in COMPLETED_WRITE_STATUSES:
+                    continue
+                rows.append(row)
+    return rows
+
+
+def pending_write_to_template_rows(rows: list[TaskTableRow]) -> list[TemplateTableRow]:
+    """将流程任务表待写入行转为模板匹配器使用的 TemplateTableRow。"""
+    result: list[TemplateTableRow] = []
+    for row in rows:
+        result.append(
+            TemplateTableRow(
+                row_index=row.row_index,
+                sheet_name=row.sheet_name,
+                sector_label=row.sector,
+                seq=row.seq,
+                original_form_name=row.form_name,
+                backend_flow=row.backend_flow,
+                remark=row.remark,
+            )
+        )
+    return result
+
+
+def load_pending_write_template_rows(path: Path) -> list[TemplateTableRow]:
+    """读取待写入 C 列流程并转为 TemplateTableRow（单独/批量写入清单）。"""
+    return pending_write_to_template_rows(load_pending_write_rows(path))
 
 
 def list_sheet_names(path: Path) -> list[str]:

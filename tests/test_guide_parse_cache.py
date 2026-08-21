@@ -32,16 +32,36 @@ def _sample_result() -> GuideParseResult:
     return GuideParseResult(source_file="guide.docx", saved_at="2026-08-12T00:00:00", source_mtime=1.0)
 
 
-def test_dev_mode_reuses_fresh_cache(dev_settings: Settings):
+def test_dev_mode_reuses_fresh_complete_cache(dev_settings: Settings):
     from core.workflow import result_store
 
     cached = _sample_result()
+    cached.parse_finished_at = "2026-08-15T12:00:00"
 
     with patch.object(result_store, "load_result", return_value=cached), patch.object(
         result_store, "is_result_stale", return_value=False
     ), patch("core.workflow.pipeline.run_guide_pipeline") as run_pipeline:
         assert result_store.ensure_guide_parse_fresh(dev_settings) is cached
         run_pipeline.assert_not_called()
+
+
+def test_dev_mode_reparses_when_cache_incomplete(dev_settings: Settings):
+    from core.workflow import result_store
+
+    cached = _sample_result()
+    cached.parse_finished_at = ""
+    reparsed = _sample_result()
+    reparsed.parse_finished_at = "2026-08-15T12:00:00"
+
+    with patch.object(result_store, "load_result", return_value=cached), patch.object(
+        result_store, "is_result_stale", return_value=False
+    ), patch("core.workflow.pipeline.run_guide_pipeline", return_value=reparsed) as run_pipeline:
+        assert result_store.ensure_guide_parse_fresh(dev_settings) is reparsed
+        run_pipeline.assert_called_once()
+
+
+def test_dev_mode_reuses_fresh_cache(dev_settings: Settings):
+    test_dev_mode_reuses_fresh_complete_cache(dev_settings)
 
 
 def test_dev_mode_auto_reparses_when_stale(dev_settings: Settings):

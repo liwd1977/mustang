@@ -210,6 +210,8 @@ def test_naming_rules_strip_person_and_merge_suffix():
 
     assert _task_name_from_content("野马集团财务副总经理 张婷婷") == "野马集团财务副总经理审批"
     assert "张婷婷" not in _task_name_from_content("野马集团财务副总经理 张婷婷")
+    assert _task_name_from_content("陈刚 野马集团总经理") == "野马集团总经理审批"
+    assert "陈刚" not in _task_name_from_content("陈刚 野马集团总经理")
     assert _task_name_from_content("总裁办主任") == "总裁办主任审批"
     assert _merge_task_name("总裁办主任") == "总裁办主任审批2"
     assert _merge_task_name("总裁办主任审批") == "总裁办主任审批2"
@@ -278,7 +280,26 @@ def test_usertask_permissions_attached_on_first_finalize():
     assert other_approval["operating"] == "readable"
 
 
-def test_audit_branch_zpbm_conditions():
+def test_zwjb_readable_on_usertasks_writable_on_start():
+    from core.workflow.shenbi_builder import build_workflow_payloads, finalize_workflow_model
+
+    model = finalize_workflow_model(build_workflow_payloads("野马集团二线招聘需求表")["model"])
+    start_fpl = (model["wfSimpleTaskInfo"].get("properties") or {}).get("fromPropertyList") or []
+    zwjb_start = next(fp for fp in start_fpl if fp.get("fieldProp") == "zwjb")
+    assert zwjb_start["operating"] == "writable"
+
+    for task in iter_all_tasks(model["wfSimpleTaskInfo"]):
+        if task.get("type") != "USERTASK":
+            continue
+        fpl = (task.get("properties") or {}).get("fromPropertyList") or []
+        zwjb = next((fp for fp in fpl if fp.get("fieldProp") == "zwjb"), None)
+        assert zwjb is not None, task.get("taskKey")
+        assert zwjb["operating"] == "readable", task.get("taskKey")
+
+    dbzrsp = next(t for t in iter_all_tasks(model["wfSimpleTaskInfo"]) if t.get("taskKey") == "dbzrsp")
+    dbzrsp_fpl = dbzrsp["properties"]["fromPropertyList"]
+    assert next(fp for fp in dbzrsp_fpl if fp["fieldProp"] == "zwjb")["operating"] == "readable"
+    assert next(fp for fp in dbzrsp_fpl if fp["fieldProp"] == "dbzrsp")["operating"] == "writable"
     import json
 
     root = compile_recruitment_from_guide(_recruitment_guide_nodes(), proc_id="p1", settings=_settings())
@@ -327,3 +348,4 @@ def test_cctask_has_no_from_property_list():
         "野马集团招聘专员",
     ]
     assert split_cc_recipients("A，B,C；D") == ["A", "B", "C", "D"]
+    assert split_cc_recipients("野马集团财务副经理（2人）") == ["野马集团财务副经理"]

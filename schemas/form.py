@@ -39,6 +39,7 @@ class TaskTableRow(BaseModel):
     backend_flow: str = Field(default="", description="C 列：后端拉取流程")
     field_flow: str = Field(default="", description="D 列：现场拉取流程")
     remark: str = ""
+    completion_status: str = Field(default="", description="F 列：完成状态")
 
 
 class WorkflowMatchItem(BaseModel):

@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from core.llm.qwen_client import QwenClient
 from core.workflow.flow_filter import format_flow_display_title, is_flow_title_line
 from core.workflow.node_graph import finalize_workflow_nodes
+from core.workflow.parse_quality import title_parse_hints, validate_flow_parse
 from schemas.workflow import SectorBlock, WorkflowFlowResult, WorkflowImage, WorkflowNodeItem
 
 ALLOWED_SHAPES = {"圆角矩形", "长方形", "菱形", "波形"}
@@ -55,7 +57,18 @@ def _normalize_shape(raw: str) -> str:
     return "长方形"
 
 
-def _normalize_node_type(raw: str, shape: str) -> str:
+def _looks_like_condition(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    if compact in {"金额", "审计部"}:
+        return True
+    return compact.startswith("是否") or "是否" in compact or compact.endswith("?") or compact.endswith("？")
+
+
+def _normalize_node_type(raw: str, shape: str, content: str = "") -> str:
+    if shape == "菱形" or _looks_like_condition(content):
+        return "判断条件"
     text = (raw or "").strip()
     lower = text.lower()
     for key, val in TYPE_ALIASES.items():
@@ -63,8 +76,6 @@ def _normalize_node_type(raw: str, shape: str) -> str:
             return val
     if text in ALLOWED_NODE_TYPES:
         return text
-    if shape == "菱形":
-        return "判断条件"
     if shape == "波形":
         return "抄送节点"
     return "处理节点"
@@ -90,12 +101,12 @@ def _parse_nodes(payload: dict) -> list[WorkflowNodeItem]:
     nodes: list[WorkflowNodeItem] = []
     for item in payload.get("nodes") or []:
         shape = _normalize_shape(str(item.get("shape") or ""))
-        node_type = _normalize_node_type(str(item.get("node_type") or item.get("type") or ""), shape)
+        content = str(item.get("content") or item.get("text") or "").strip()
+        node_type = _normalize_node_type(str(item.get("node_type") or item.get("type") or ""), shape, content)
         try:
             seq = int(item.get("seq"))
         except (TypeError, ValueError):
             continue
-        content = str(item.get("content") or item.get("text") or "").strip()
         nodes.append(
             WorkflowNodeItem(
                 seq=seq,
@@ -126,25 +137,43 @@ def recognize_workflow_flow(
     context_text: str = "",
     fallback_title: str = "",
 ) -> WorkflowFlowResult:
+    title_hint = (image.title_hint or "").strip()
+    hints = title_parse_hints(title_hint)
+    ctx = f"{context_text}\n{hints}".strip() if hints else context_text
+    last_error = ""
+
     try:
-        payload = client.recognize_flowchart(
-            Path(image.path),
-            context_text=context_text,
-        )
-        nodes = _parse_nodes(payload)
-        if not nodes:
-            return WorkflowFlowResult(
-                image=image,
-                title=_display_title(image, raw=str(payload.get("title") or ""), fallback=fallback_title),
-                success=False,
-                error="解析失败：未识别到有效节点",
+        for attempt in range(2):
+            prompt = ""
+            if attempt == 1:
+                prompt = (
+                    QwenClient._default_flowchart_prompt(ctx)
+                    + "\n\n【重试】上次 JSON 与流程图文字不符。"
+                    "请严格按图片中菱形/方框内文字输出（如「子公司」「分销网站」「金额」），"
+                    "勿套用「是否OA」「预算审批」等其它模板。"
+                )
+            payload = client.recognize_flowchart(
+                Path(image.path),
+                context_text=ctx,
+                prompt=prompt,
             )
+            nodes = _parse_nodes(payload)
+            ok, reason = validate_flow_parse(title_hint, nodes)
+            if nodes and ok:
+                return WorkflowFlowResult(
+                    image=image,
+                    title=_display_title(image, raw=str(payload.get("title") or ""), fallback=fallback_title),
+                    success=True,
+                    confidence=float(payload.get("confidence") or 0.0),
+                    nodes=nodes,
+                )
+            last_error = reason or "解析失败：未识别到有效节点"
+
         return WorkflowFlowResult(
             image=image,
-            title=_display_title(image, raw=str(payload.get("title") or ""), fallback=fallback_title),
-            success=True,
-            confidence=float(payload.get("confidence") or 0.0),
-            nodes=nodes,
+            title=_display_title(image, fallback=fallback_title),
+            success=False,
+            error=f"解析失败：{last_error}",
         )
     except Exception as exc:
         return WorkflowFlowResult(

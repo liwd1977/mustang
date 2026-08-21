@@ -51,11 +51,16 @@ def test_resolve_platform_ids_ignores_builder_placeholder_ids():
 def test_build_app_save_payload_uses_workflow_display_name():
     from core.workflow.shenbi_client import build_app_save_payload
 
-    payload = build_app_save_payload("野马集团二线招聘需求表")
-    assert payload["mc"] == "野马集团二线招聘需求"
-    assert payload["yydl"] == "3"
+    payload = build_app_save_payload(
+        "野马集团二线招聘需求表",
+        sector_title="野马集团",
+        sector_index=2,
+    )
+    assert payload["mc"] == "野马集团二线招聘需求表"
+    assert payload["yydl"] == "2"
     assert payload["sfqy"] == "1"
     assert "野马集团二线部门招聘需求表" in payload["yyjj"]
+    assert payload["icons"].startswith("http")
 
 
 def test_legacy_registry_not_verified():
@@ -101,13 +106,64 @@ def test_verified_registry_used_for_update():
     assert app_id == "app123"
 
 
+def test_collect_app_name_candidates_includes_legacy_suffix_variants():
+    from core.workflow.shenbi_client import collect_app_name_candidates
+
+    names = collect_app_name_candidates("集团费用报销单")
+    assert "集团费用报销单" in names
+    assert "集团费用报销" in names
+
+
+def test_find_app_ids_by_name_candidates_matches_legacy_name():
+    from unittest.mock import patch
+
+    from core.workflow.shenbi_client import find_app_ids_by_name_candidates
+
+    apps = [
+        {"id": "app-old", "mc": "集团费用报销"},
+        {"id": "app-new", "mc": "集团费用报销单"},
+        {"id": "app-other", "mc": "其他流程"},
+    ]
+    with patch("core.workflow.shenbi_client.query_app_list", return_value=apps):
+        matches = find_app_ids_by_name_candidates(["集团费用报销单", "集团费用报销"])
+    assert ("app-old", "集团费用报销") in matches
+    assert ("app-new", "集团费用报销单") in matches
+
+
+def test_rebind_flow_menus_for_workflow_aliases_covers_all_apps():
+    from unittest.mock import patch
+
+    from core.workflow.shenbi_client import rebind_flow_menus_for_workflow_aliases
+
+    apps = [
+        {"id": "app-old", "mc": "外贸集团样车合同备案"},
+        {"id": "app-new", "mc": "外贸集团样车合同备案表"},
+    ]
+    with patch("core.workflow.shenbi_client.query_app_list", return_value=apps):
+        with patch("core.workflow.shenbi_client.rebind_all_flow_menus", return_value=[{"step": "ok"}]) as rebind_mock:
+            steps = rebind_flow_menus_for_workflow_aliases(
+                workflow_name="外贸集团样车合同备案表",
+                primary_app_id="app-new",
+                title="外贸集团样车合同备案表",
+                form_id="form1",
+                proc_id="proc1",
+                proc_key="cslc_test",
+            )
+    assert steps == [{"step": "ok"}, {"step": "ok"}]
+    rebound_ids = {call.kwargs["app_id"] for call in rebind_mock.call_args_list}
+    assert rebound_ids == {"app-old", "app-new"}
+
+
 def test_ensure_app_reuses_existing_name():
     from unittest.mock import patch
 
     from core.workflow.shenbi_client import ensure_app_for_workflow
 
     with patch("core.workflow.shenbi_client.load_workflow_registry", return_value=None):
-        with patch("core.workflow.shenbi_client.find_app_id_by_mc", return_value="app-existing"):
+        with patch(
+            "core.workflow.shenbi_client.resolve_app_id_for_workflow",
+            return_value=("app-existing", "reuse"),
+        ):
             with patch(
                 "core.workflow.shenbi_client.save_or_update_app",
                 return_value={"code": 200, "data": "app-existing"},
@@ -124,15 +180,22 @@ def test_ensure_app_retries_when_name_exists():
     from core.workflow.shenbi_client import ShenbiApiError, ensure_app_for_workflow
 
     with patch("core.workflow.shenbi_client.load_workflow_registry", return_value=None):
-        with patch("core.workflow.shenbi_client.find_app_id_by_mc", side_effect=[None, "app-existing"]):
+        with patch(
+            "core.workflow.shenbi_client.resolve_app_id_for_workflow",
+            return_value=(None, "create"),
+        ):
             with patch(
-                "core.workflow.shenbi_client.save_or_update_app",
-                side_effect=[
-                    ShenbiApiError("创建应用失败（code=99999）：应用名称已经存在", body={"msg": "应用名称已经存在"}),
-                    {"code": 200, "data": "app-existing"},
-                ],
-            ) as save_mock:
-                app_id, step = ensure_app_for_workflow("野马集团二线招聘需求表")
+                "core.workflow.shenbi_client.find_app_ids_by_name_candidates",
+                return_value=[("app-existing", "野马集团二线招聘需求表")],
+            ):
+                with patch(
+                    "core.workflow.shenbi_client.save_or_update_app",
+                    side_effect=[
+                        ShenbiApiError("创建应用失败（code=99999）：应用名称已经存在", body={"msg": "应用名称已经存在"}),
+                        {"code": 200, "data": "app-existing"},
+                    ],
+                ) as save_mock:
+                    app_id, step = ensure_app_for_workflow("野马集团二线招聘需求表")
     assert app_id == "app-existing"
     assert step["mode"] == "reuse"
     assert save_mock.call_count == 2
@@ -173,7 +236,7 @@ def test_build_flow_menu_payload_matches_platform_shape():
 
     payload = build_flow_menu_payload(
         app_id="app1",
-        title="野马集团二线招聘需求",
+        title="野马集团二线招聘需求表",
         form_id="form1",
         proc_id="proc1",
         proc_key="cslc_d7beff",
@@ -184,6 +247,36 @@ def test_build_flow_menu_payload_matches_platform_shape():
     assert payload["extendInfo"]["queryId"] == "proc1"
     assert payload["extendInfo"]["resourceExtList"][1]["extPropertyValue"] == "proc1"
     assert payload["extendInfo"]["tableName"] == "F_cslc_d7beff"
+
+
+def test_rebind_all_flow_menus_renames_stale_title():
+    from unittest.mock import patch
+
+    from core.workflow.shenbi_client import rebind_all_flow_menus
+
+    menus = [
+        {
+            "menuId": "menu1",
+            "menuType": 2,
+            "title": "集团费用",
+            "sortNumber": 5,
+            "extendInfo": {"trendsFlowId": "form1", "queryId": "proc1"},
+        }
+    ]
+    with patch("core.workflow.shenbi_client.list_flow_menus", return_value=menus):
+        with patch(
+            "core.workflow.shenbi_client.save_app_menu",
+            return_value={"code": 200, "data": "menu1"},
+        ) as save_mock:
+            steps = rebind_all_flow_menus(
+                app_id="app1",
+                title="集团费用报销单",
+                form_id="form1",
+                proc_id="proc1",
+                proc_key="cslc_a2103d",
+            )
+    assert steps[0]["mode"] == "rebind"
+    assert save_mock.call_args[0][0]["title"] == "集团费用报销单"
 
 
 def test_ensure_flow_menu_rebinds_wrong_ids():
@@ -253,7 +346,7 @@ def test_assess_model_save_response_warns_when_task_missing():
     assert "未在响应" in hint["message"]
 
 
-def test_apply_registry_complex_recruitment_only_app_id():
+def test_apply_registry_injects_ids_for_verified_registry():
     from unittest.mock import patch
 
     from core.workflow.shenbi_client import apply_registry_to_payloads
@@ -267,15 +360,29 @@ def test_apply_registry_complex_recruitment_only_app_id():
         "app_created_via_api": True,
         "task_id_by_key": {"t1": "id1"},
     }
-    payloads = build_workflow_payloads("野马集团二线招聘需求表")
-    with patch("core.workflow.shenbi_client.load_workflow_registry", return_value=verified):
-        merged = apply_registry_to_payloads(payloads, "野马集团二线招聘需求表")
-    model = merged["model"]
-    assert model["wfSimpleProc"]["appId"] == "app123"
-    assert model["formModel"].get("formId") in (None, "")
-    assert model["wfSimpleProc"].get("id") in (None, "")
-    for task in iter_all_tasks(model.get("wfSimpleTaskInfo")):
-        assert task.get("id") in (None, "")
+    for workflow_name in ("野马集团二线招聘需求表", "外贸集团样车合同备案表"):
+        payloads = build_workflow_payloads(workflow_name)
+        with patch("core.workflow.shenbi_client.load_workflow_registry", return_value=verified):
+            merged = apply_registry_to_payloads(payloads, workflow_name)
+        model = merged["model"]
+        assert model["wfSimpleProc"]["appId"] == "app123"
+        assert model["formModel"]["formId"] == "f-stale"
+        assert model["wfSimpleProc"]["id"] == "p-stale"
+        assert model["wfSimpleProc"]["procKey"] == "cslc_old"
+        assert merged.get("is_update") is True
+
+
+def test_apply_registry_complex_recruitment_injects_ids():
+    test_apply_registry_injects_ids_for_verified_registry()
+
+
+def test_clamp_platform_field_name_truncates_long_labels():
+    from core.form.name_utils import clamp_platform_field_name
+
+    long_label = "这是一个超过五十个汉字长度的非常长的表单字段名称用于测试平台字段名截断逻辑是否生效" * 2
+    clipped = clamp_platform_field_name(long_label)
+    assert len(clipped) <= 50
+    assert clipped.endswith("…")
 
 
 def test_is_stale_registry_save_error():
@@ -308,23 +415,25 @@ def test_complex_builder_ignores_registry_ids():
     assert model["formModel"].get("tableName") in (None, "")
 
 
-def test_prepare_complex_update_strips_task_ids():
+def test_prepare_create_strips_task_ids_and_null_form_json():
     from core.workflow.shenbi_client import _prepare_model_save_body
 
     model = finalize_workflow_model(build_workflow_payloads("野马集团二线招聘需求表")["model"])
     body = _prepare_model_save_body(
         model,
         app_id="app1",
-        is_update=True,
-        form_id="form1",
-        proc_id="proc1",
-        flow_kind="complex_recruitment",
-        strip_complex_tasks=True,
+        is_update=False,
+        form_id=None,
+        proc_id=None,
     )
     assert body.get("formModelJson") is None
     for task in iter_all_tasks(body.get("wfSimpleTaskInfo")):
         assert task.get("id") in (None, "")
         assert task.get("procId") in (None, "")
+
+
+def test_prepare_complex_update_strips_task_ids():
+    test_prepare_create_strips_task_ids_and_null_form_json()
 
 
 def test_assess_complex_write_outcome_warns_when_model_get_incomplete():
@@ -400,11 +509,11 @@ def test_usertask_non_current_approval_readable():
     model = finalize_workflow_model(build_workflow_payloads("野马集团二线招聘需求表")["model"])
     task = next(
         t for t in iter_all_tasks(model["wfSimpleTaskInfo"])
-        if t.get("taskKey") == "ymjtcwzjsp"
+        if t.get("taskKey") == "ymjtcwfjlsp"
     )
     fpl = task["properties"]["fromPropertyList"]
     assert next(fp for fp in fpl if fp["fieldProp"] == "orgId")["operating"] == "readable"
-    assert next(fp for fp in fpl if fp["fieldProp"] == "ymjtcwzjsp")["operating"] == "writable"
+    assert next(fp for fp in fpl if fp["fieldProp"] == "ymjtcwfjlsp")["operating"] == "writable"
     assert next(fp for fp in fpl if fp["fieldProp"] == "zcbzrsp")["operating"] == "readable"
 
 
@@ -417,3 +526,58 @@ def test_verify_model_integrity_recruitment():
     result = verify_model_integrity(model)
     assert result["ok"]
     assert result["task_types"] == count_task_types(model["wfSimpleTaskInfo"])
+
+
+def test_prepare_full_tree_update_body_strips_task_ids():
+    from core.workflow.complex_flow_builder import iter_all_tasks
+    from core.workflow.shenbi_client import _prepare_full_tree_update_body
+
+    model = finalize_workflow_model(build_workflow_payloads("集团费用报销单")["model"])
+    local_tree = model["wfSimpleTaskInfo"]
+    for task in iter_all_tasks(local_tree):
+        task["id"] = "old-id"
+    body = _prepare_full_tree_update_body(
+        model,
+        local_tree=local_tree,
+        app_id="app1",
+        form_id="form1",
+        proc_id="proc1",
+    )
+    assert body["formModel"]["formId"] == "form1"
+    assert body["wfSimpleProc"]["id"] == "proc1"
+    for task in iter_all_tasks(body.get("wfSimpleTaskInfo")):
+        assert task.get("id") in (None, "")
+        assert task.get("procId") in (None, "")
+
+
+def test_write_result_tree_confirmed_requires_non_degraded_response():
+    from core.workflow.shenbi_client import write_result_tree_confirmed
+
+    model = finalize_workflow_model(build_workflow_payloads("集团费用报销单")["model"])
+    good = {
+        "results": [
+            {
+                "step": "表单与流程",
+                "response": {
+                    "code": 200,
+                    "data": {"wfSimpleTaskInfo": model["wfSimpleTaskInfo"]},
+                },
+            }
+        ]
+    }
+    assert write_result_tree_confirmed(good, local_model=model)
+
+    shell = {
+        "type": "STARTTASK",
+        "taskName": "办理start",
+        "child": {"type": "ROUTE", "conditions": [{}, {}]},
+    }
+    bad = {
+        "results": [
+            {
+                "step": "表单与流程",
+                "response": {"code": 200, "data": {"wfSimpleTaskInfo": shell}},
+            }
+        ]
+    }
+    assert not write_result_tree_confirmed(bad, local_model=model)
