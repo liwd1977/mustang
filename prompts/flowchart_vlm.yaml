@@ -1,0 +1,9 @@
+name: flowchart_vlm
+description: 办事指南流程图 VLM 识别 Prompt
+temperature: 0.1
+output_format: json
+fields:
+  - nodes
+  - edges
+  - conditions
+  - confidence

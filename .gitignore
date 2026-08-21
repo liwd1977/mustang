@@ -18,7 +18,7 @@ build/
 
 # Generated outputs
 output/
-*.log
+logs/*.log
 
 # OS
 .DS_Store
